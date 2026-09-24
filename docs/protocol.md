@@ -6,6 +6,9 @@
 - Identical call IDs and canonical arguments execute once per session.
   Conflicting arguments/name/response owner fail the session. This is bounded
   session deduplication, not durable exactly-once execution.
+- A model mistake fails only its own call. Invalid JSON, schema violations,
+  unknown tools, arguments over the size limit and calls beyond the concurrency
+  limit each receive an error result without executing; the session continues.
 - Results are `function_call_output` items. Client continuation waits for the
   response to finish successfully and for all results to be accepted, then
   sends one `response.create`. `Continuation::Server` delegates this entirely
@@ -20,6 +23,9 @@
 - Stop the player first. Send `interrupt` with final rendered-sample positions,
   or `playback_stopped` after server cancellation. The harness truncates each
   audio part at its heard position. Omitted parts are treated as unheard.
+  Stopping never depends on truncation support: with
+  `Capabilities.truncate = false` the harness still validates positions, cancels
+  and invalidates playback, but the endpoint keeps the unheard text in context.
   Generated duration is only a validation bound. PCM/G711 bounds retain each
   part's accepted format; a format change within one part is rejected.
 - If generation has finished while playback remains buffered, the host still
@@ -33,7 +39,8 @@ terminate instead of silently dropping audio or accumulating stale playback.
 
 Defaults: 64 ordinary messages per queue, 8 priority commands, 16 priority writes,
 64 KiB per encoded audio chunk, 8 MiB per message, 16 concurrent tools, 64 KiB tool
-arguments/results, 4,096 lifetime calls/audio parts and 8,192 responses. Large
+arguments/results, 4,096 lifetime calls/audio parts and 8,192 responses. Only
+the lifetime ledgers and host-side queues end a session when exhausted. Large
 images can still occupy the message-size bound per slot; tune `Limits` for your
 host and use small paced audio frames. Lifetime ledgers retain IDs until the
 session ends at their cap.

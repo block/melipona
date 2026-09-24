@@ -70,6 +70,8 @@ impl AudioFormat {
 pub struct Capabilities {
     pub audio_input: bool,
     pub image_input: bool,
+    /// `conversation.item.truncate` support. Without it, stopping still cancels and invalidates
+    /// playback, but the endpoint's context keeps the unheard remainder of the reply.
     pub truncate: bool,
     pub output_audio: AudioFormat,
 }
@@ -91,8 +93,10 @@ pub struct Limits {
     pub message_bytes: usize,
     /// Encoded audio cap, independent of larger image/control messages.
     pub audio_chunk_bytes: usize,
+    /// Oversized model arguments answer that call with an error; the session continues.
     pub tool_argument_bytes: usize,
     pub tool_result_bytes: usize,
+    /// Calls beyond this answer with an error instead of queueing; the session continues.
     pub concurrent_tools: usize,
     /// Lifetime bounds: exceeding them ends the session instead of evicting deduplication history.
     pub calls: usize,
@@ -212,15 +216,30 @@ pub enum Command {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     /// A caller mistake rejects only that command; it does not cancel the session or tools.
-    CommandRejected { error: String },
+    CommandRejected {
+        error: String,
+    },
     /// All public server events, including unknown types. Suppressed stale media is omitted.
-    Server { event: Value },
+    Server {
+        event: Value,
+    },
     /// Clear queued playback for this response, then report PlaybackStopped with final positions.
-    PlaybackClear { response_id: String },
+    PlaybackClear {
+        response_id: String,
+    },
     Tool {
         call_id: String,
-        state: &'static str,
+        state: ToolState,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolState {
+    /// The call is committed; exactly one result follows in this session.
+    Admitted,
+    /// Its result or error was sent as a function_call_output item.
+    ResultSent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

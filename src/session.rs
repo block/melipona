@@ -237,14 +237,20 @@ struct Coordinator {
     ready: bool,
     frankie_feedback: bool,
     init_id: String,
+    init_deadline: Instant,
     create_id: Option<(String, Instant)>,
+    received: Instant,
+    ping_sent: bool,
 }
 
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Owns the socket for one session. Every `select!` arm delegates to one Coordinator
+/// method so the protocol state machine is readable and formatted outside the macro.
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    socket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    socket: Socket,
     config: Config,
     registry: Arc<ToolRegistry>,
     mut commands: mpsc::Receiver<Command>,
@@ -254,32 +260,18 @@ async fn run(
     playback: watch::Sender<PlaybackState>,
     shutdown: CancellationToken,
 ) -> Result<(), Error> {
-    let (mut sink, mut stream) = socket.split();
-    let (outgoing, mut writes) = mpsc::channel::<Write>(config.limits.queue);
-    let (urgent, mut priority_writes) = mpsc::channel::<Write>(16);
-    let write_timeout = config.limits.write_timeout;
-    let mut writer = tokio::spawn(async move {
-        loop {
-            let write = tokio::select! {
-                biased;
-                write = priority_writes.recv() => write,
-                write = writes.recv() => write,
-            };
-            let Some(write) = write else { break };
-            timeout(write_timeout, async {
-                match write {
-                    Write::Frame(message) => sink.send(message).await,
-                    Write::Flush => sink.flush().await,
-                }
-            })
-            .await
-            .map_err(|_| Error::Timeout("write"))?
-            .map_err(|_| Error::Disconnected)?;
-        }
-        Ok::<_, Error>(())
-    });
-    let init_deadline = Instant::now() + config.limits.initialize_timeout;
+    let (sink, mut stream) = socket.split();
+    let (outgoing, writes) = mpsc::channel::<Write>(config.limits.queue);
+    let (urgent, priority_writes) = mpsc::channel::<Write>(16);
+    let mut writer = tokio::spawn(write_frames(
+        sink,
+        priority_writes,
+        writes,
+        config.limits.write_timeout,
+    ));
+    let now = Instant::now();
     let mut c = Coordinator {
+        init_deadline: now + config.limits.initialize_timeout,
         config,
         registry,
         outgoing,
@@ -295,69 +287,45 @@ async fn run(
         frankie_feedback: false,
         init_id: id(),
         create_id: None,
+        received: now,
+        ping_sent: false,
     };
     let mut writer_joined = false;
     let mut result = async {
         c.send(json!({"type":"session.update","event_id":c.init_id,"session":c.config.session}))?;
         let mut tick = tokio::time::interval(Duration::from_millis(25));
-        let mut received = Instant::now();
-        let mut ping_sent = false;
         loop {
-            if shutdown.is_cancelled() {return Ok(());}
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            // Controls overtake ordinary commands even when both are ready.
             if let Ok(command) = controls.try_recv() {
-                if matches!(command,Command::Close) { return Ok(()); }
-                c.accept_command(command)?;
+                if !c.accept(Some(command))? {
+                    return Ok(());
+                }
                 continue;
             }
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                result = &mut writer => { writer_joined = true; return result.map_err(|_| Error::Disconnected)?.and(Err(Error::Disconnected)); },
                 _ = c.events.closed() => return Ok(()),
-                command = controls.recv() => match command {
-                    Some(Command::Close) | None => return Ok(()),
-                    Some(command) => c.accept_command(command)?,
-                },
-                _ = tick.tick() => {
-                    let now = Instant::now();
-                    if now.duration_since(received) >= c.config.limits.idle_timeout { return Err(Error::Timeout("peer liveness")); }
-                    if !ping_sent && now.duration_since(received) >= c.config.limits.idle_timeout / 2 {
-                        c.enqueue(Write::Frame(Message::Ping(Vec::new().into())),true)?;
-                        ping_sent = true;
-                    }
-                    if !c.ready && now >= init_deadline { return Err(Error::Timeout("session initialization")); }
-                    if c.calls.values().any(|call| call.deadline.is_some_and(|t| now >= t)) {
-                        return Err(Error::Timeout("tool result acknowledgement"));
-                    }
-                    if c.create_id.as_ref().is_some_and(|(_,t)| now >= *t) {
-                        return Err(Error::Timeout("response creation"));
-                    }
+                joined = &mut writer => {
+                    writer_joined = true;
+                    return joined.map_err(|_| Error::Disconnected)?.and(Err(Error::Disconnected));
                 }
-                command = commands.recv(), if c.ready => match command {
-                    Some(Command::Close) | None => return Ok(()),
-                    Some(command) => c.accept_command(command)?,
-                },
-                result = c.tasks.join_next(), if !c.tasks.is_empty() => {
-                    let result = result.expect("nonempty tasks").map_err(|_| Error::Protocol("tool worker failed".into()))?;
-                    c.tool_result(result)?;
-                }
-                message = stream.next() => {
-                    received=Instant::now(); ping_sent=false;
-                    match message {
-                    Some(Ok(Message::Text(text))) => {
-                        let event: Value = serde_json::from_str(&text).map_err(|_| Error::Protocol("invalid server JSON".into()))?;
-                        c.server(event)?;
-                        if c.ready && *status.borrow() != Status::Ready { status.send_replace(Status::Ready); }
-                    }
-                    Some(Ok(Message::Ping(_))) => c.enqueue(Write::Flush,true)?,
-                    Some(Ok(Message::Pong(_))) => {},
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Disconnected),
-                    Some(Err(_)) => return Err(Error::Disconnected),
-                    _ => return Err(Error::Protocol("expected JSON text frame".into())),
+                command = controls.recv() => if !c.accept(command)? { return Ok(()) },
+                command = commands.recv(), if c.ready => if !c.accept(command)? { return Ok(()) },
+                _ = tick.tick() => c.check_deadlines()?,
+                joined = c.tasks.join_next(), if !c.tasks.is_empty() => c.tool_joined(joined)?,
+                frame = stream.next() => {
+                    c.frame(frame)?;
+                    if c.ready && *status.borrow() != Status::Ready {
+                        status.send_replace(Status::Ready);
                     }
                 }
             }
         }
-    }.await;
+    }
+    .await;
     for call in c.calls.values() {
         call.cancel.cancel();
     }
@@ -375,6 +343,64 @@ async fn run(
         }
     }
     result
+}
+
+/// Urgent frames (cancel, truncate, pong flush) overtake queued media, never a frame in flight.
+async fn write_frames(
+    mut sink: futures_util::stream::SplitSink<Socket, Message>,
+    mut priority: mpsc::Receiver<Write>,
+    mut ordinary: mpsc::Receiver<Write>,
+    write_timeout: Duration,
+) -> Result<(), Error> {
+    loop {
+        let write = tokio::select! {
+            biased;
+            write = priority.recv() => write,
+            write = ordinary.recv() => write,
+        };
+        let Some(write) = write else {
+            return Ok(());
+        };
+        let io = async {
+            match write {
+                Write::Frame(message) => sink.send(message).await,
+                Write::Flush => sink.flush().await,
+            }
+        };
+        timeout(write_timeout, io)
+            .await
+            .map_err(|_| Error::Timeout("write"))?
+            .map_err(|_| Error::Disconnected)?;
+    }
+}
+
+/// Runs one validated call. Cancellation and timeout report that side effects may have happened.
+async fn execute(
+    registry: Arc<ToolRegistry>,
+    call: ToolCall,
+    cancel: CancellationToken,
+    limit: Duration,
+) -> ToolResult {
+    let call_id = call.call_id.clone();
+    let work = AssertUnwindSafe(registry.executor.execute(call, cancel.clone())).catch_unwind();
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            Err("cancelled; external side effects may already have occurred".to_owned())
+        }
+        finished = timeout(limit, work) => match finished {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("tool_panicked".into()),
+            Err(_) => {
+                cancel.cancel();
+                Err("tool_timeout; external side effects may already have occurred".into())
+            }
+        },
+    };
+    ToolResult {
+        call_id,
+        value: result.unwrap_or_else(|error| json!({ "error": error })),
+    }
 }
 
 impl Coordinator {
@@ -427,16 +453,75 @@ impl Coordinator {
         ));
         Ok(())
     }
-    fn accept_command(&mut self, command: Command) -> Result<(), Error> {
-        if let Err(error) = self.command(command) {
-            match error {
-                Error::Config(_) | Error::Protocol(_) => self.emit(Event::CommandRejected {
+    /// Returns false when the host closed the session. A caller mistake rejects only
+    /// that command; resource and transport failures end the session.
+    fn accept(&mut self, command: Option<Command>) -> Result<bool, Error> {
+        let Some(command) = command.filter(|c| !matches!(c, Command::Close)) else {
+            return Ok(false);
+        };
+        match self.command(command) {
+            Err(error @ (Error::Config(_) | Error::Protocol(_))) => {
+                self.emit(Event::CommandRejected {
                     error: error.to_string(),
-                })?,
-                other => return Err(other),
+                })?;
             }
+            other => other?,
+        }
+        Ok(true)
+    }
+    fn check_deadlines(&mut self) -> Result<(), Error> {
+        let now = Instant::now();
+        let silent = now.duration_since(self.received);
+        let idle = self.config.limits.idle_timeout;
+        if silent >= idle {
+            return Err(Error::Timeout("peer liveness"));
+        }
+        if !self.ping_sent && silent >= idle / 2 {
+            self.enqueue(Write::Frame(Message::Ping(Vec::new().into())), true)?;
+            self.ping_sent = true;
+        }
+        if !self.ready && now >= self.init_deadline {
+            return Err(Error::Timeout("session initialization"));
+        }
+        if self
+            .calls
+            .values()
+            .any(|call| call.deadline.is_some_and(|t| now >= t))
+        {
+            return Err(Error::Timeout("tool result acknowledgement"));
+        }
+        if self.create_id.as_ref().is_some_and(|(_, t)| now >= *t) {
+            return Err(Error::Timeout("response creation"));
         }
         Ok(())
+    }
+    fn tool_joined(
+        &mut self,
+        joined: Option<Result<ToolResult, tokio::task::JoinError>>,
+    ) -> Result<(), Error> {
+        let result = joined
+            .expect("polled only while tasks are pending")
+            .map_err(|_| Error::Protocol("tool worker failed".into()))?;
+        self.tool_result(result)
+    }
+    fn frame(
+        &mut self,
+        frame: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    ) -> Result<(), Error> {
+        self.received = Instant::now();
+        self.ping_sent = false;
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let event = serde_json::from_str(&text)
+                    .map_err(|_| Error::Protocol("invalid server JSON".into()))?;
+                self.server(event)
+            }
+            // Tungstenite queues the pong; flushing sends it ahead of ordinary media.
+            Some(Ok(Message::Ping(_))) => self.enqueue(Write::Flush, true),
+            Some(Ok(Message::Pong(_))) => Ok(()),
+            Some(Ok(Message::Close(_)) | Err(_)) | None => Err(Error::Disconnected),
+            Some(Ok(_)) => Err(Error::Protocol("expected JSON text frame".into())),
+        }
     }
     fn command(&mut self, command: Command) -> Result<(), Error> {
         match command {
@@ -541,11 +626,6 @@ impl Coordinator {
         self.send(json!({"type":"conversation.item.create","item":{"id":id(),"type":"message","role":"user","content":content}}))
     }
     fn validate_heard(&self, rid: &str, heard: &[Heard]) -> Result<(), Error> {
-        if !self.config.capabilities.truncate && self.audio.values().any(|p| p.response == rid) {
-            return Err(Error::Config(
-                "endpoint truncation disabled for audio".into(),
-            ));
-        }
         if !self.responses.contains_key(rid) {
             return Err(Error::Protocol("unknown playback response".into()));
         }
@@ -588,6 +668,10 @@ impl Coordinator {
                 .get_mut(&(h.item_id.clone(), h.content_index))
                 .expect("validated")
                 .heard = h.audio_end_ms;
+        }
+        // Stopping never depends on this capability; only the endpoint's context does.
+        if !self.config.capabilities.truncate {
+            return Ok(());
         }
         let parts: Vec<_> = self
             .audio
@@ -775,18 +859,19 @@ impl Coordinator {
         let call_id = field(item, "call_id")?.to_owned();
         let name = field(item, "name")?.to_owned();
         let raw = field(item, "arguments")?;
-        if raw.len() > self.config.limits.tool_argument_bytes {
-            return Err(Error::Capacity("tool arguments"));
-        }
-        let parsed = serde_json::from_str::<Value>(raw).map(|mut value| {
-            // Cargo features are additive across the embedding application.
-            value.sort_all_objects();
-            value
+        // Oversized arguments are never parsed or retained; the call still gets an answer.
+        let parsed = (raw.len() <= self.config.limits.tool_argument_bytes).then(|| {
+            serde_json::from_str::<Value>(raw).map(|mut value| {
+                // Cargo features are additive across the embedding application.
+                value.sort_all_objects();
+                value
+            })
         });
-        let fingerprint = parsed
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| raw.to_owned());
+        let fingerprint = match &parsed {
+            Some(Ok(value)) => value.to_string(),
+            Some(Err(_)) => raw.to_owned(),
+            None => format!("oversized:{}", raw.len()),
+        };
         if let Some(existing) = self.calls.get(&call_id) {
             if existing.response != rid
                 || existing.name != name
@@ -801,9 +886,6 @@ impl Coordinator {
         }
         if self.calls.len() >= self.config.limits.calls {
             return Err(Error::Capacity("tool call ledger"));
-        }
-        if self.tasks.len() >= self.config.limits.concurrent_tools {
-            return Err(Error::Capacity("concurrent tools"));
         }
         let cancel = CancellationToken::new();
         self.calls.insert(
@@ -822,29 +904,38 @@ impl Coordinator {
         self.response(rid)?.calls.insert(call_id.clone());
         self.emit(Event::Tool {
             call_id: call_id.clone(),
-            state: "admitted",
+            state: ToolState::Admitted,
         })?;
-        let registry = self.registry.clone();
-        let duration = self.config.limits.tool_timeout;
-        self.tasks.spawn(async move {
-            let work=async {
-                let arguments=parsed.map_err(|_|"invalid_arguments_json".to_owned())?;
-                let validator=registry.validators.get(&name).ok_or_else(||"unknown_tool".to_owned())?;
-                if !validator.is_valid(&arguments) { return Err("invalid_arguments_schema".into()); }
-                registry.executor.execute(ToolCall{call_id:call_id.clone(),name,arguments},cancel.clone()).await
-            };
-            let result=tokio::select! {
-                biased;
-                _=cancel.cancelled()=>Err("cancelled; external side effects may already have occurred".to_owned()),
-                result=timeout(duration,AssertUnwindSafe(work).catch_unwind())=>match result {
-                    Ok(Ok(value))=>value,
-                    Ok(Err(_))=>Err("tool_panicked".into()),
-                    Err(_)=>{ cancel.cancel(); Err("tool_timeout; external side effects may already have occurred".into()) },
-                },
-            };
-            ToolResult{call_id,value:match result {Ok(v)=>v,Err(e)=>json!({"error":e})}}
-        });
-        Ok(())
+        // A model mistake fails only its own call, never the conversation.
+        let arguments = match parsed {
+            None => Err("tool_arguments_too_large"),
+            Some(Err(_)) => Err("invalid_arguments_json"),
+            Some(Ok(arguments)) => match self.registry.validators.get(&name) {
+                None => Err("unknown_tool"),
+                Some(schema) if !schema.is_valid(&arguments) => Err("invalid_arguments_schema"),
+                Some(_) if self.tasks.len() >= self.config.limits.concurrent_tools => {
+                    Err("tool_concurrency_limit")
+                }
+                Some(_) => Ok(arguments),
+            },
+        };
+        match arguments {
+            Ok(arguments) => {
+                let call = ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                };
+                let registry = self.registry.clone();
+                let limit = self.config.limits.tool_timeout;
+                self.tasks.spawn(execute(registry, call, cancel, limit));
+                Ok(())
+            }
+            Err(error) => self.tool_result(ToolResult {
+                call_id,
+                value: json!({ "error": error }),
+            }),
+        }
     }
     fn tool_result(&mut self, result: ToolResult) -> Result<(), Error> {
         let mut output = result.value.to_string();
@@ -860,7 +951,7 @@ impl Coordinator {
         call.deadline = Some(Instant::now() + self.config.limits.acknowledgement_timeout);
         self.emit(Event::Tool {
             call_id: result.call_id,
-            state: "result_sent",
+            state: ToolState::ResultSent,
         })?;
         Ok(())
     }

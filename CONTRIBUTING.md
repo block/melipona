@@ -2,6 +2,9 @@
 
 Open an issue for bugs or proposed changes, and submit pull requests against
 `main`. Keep the core provider-neutral and put optional test workflows in examples.
+A provider extension belongs in the core only if it is off by default, enabled by
+explicit configuration, used only after the server advertises it, and limited to
+an outbound allowlist, as the Frankie playback extension is.
 
 Use current stable Rust. From a checkout, run:
 

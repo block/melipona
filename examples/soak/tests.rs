@@ -528,6 +528,8 @@ async fn explicit_overlap_after_generation_done_uses_heard_samples() {
             );
             if event["type"] == "conversation.item.truncate" {
                 assert_eq!(event["audio_end_ms"], 96);
+                // The turn must not settle until the provider confirms the truncation.
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 put(&mut peer,json!({"type":"conversation.item.truncated","item_id":"i","content_index":0,"audio_end_ms":96})).await;
                 break;
             }
@@ -558,6 +560,10 @@ async fn explicit_overlap_after_generation_done_uses_heard_samples() {
     assert_eq!(m.outcome, "pass");
     assert_eq!(m.rendered_audio_ms, 96);
     assert!(m.time_to_stop_ms.unwrap() < 10.0);
+    assert!(
+        m.elapsed_ms >= 96.0 + 150.0,
+        "settled before truncation ack"
+    );
     session.finish().await.unwrap();
     server.await.unwrap();
     drop(log);

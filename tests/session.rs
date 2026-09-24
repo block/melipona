@@ -654,12 +654,10 @@ async fn bounded_command_queue_is_nonblocking_and_consumer_overflow_is_terminal(
 }
 
 #[tokio::test]
-async fn bounded_arguments_concurrent_work_and_lifetime_ledgers() {
-    for scenario in ["arguments", "concurrent", "calls", "responses", "audio"] {
+async fn lifetime_ledgers_end_the_session_at_their_cap() {
+    for scenario in ["calls", "responses", "audio"] {
         let (tools, _) = registry();
         let (mut session, mut peer) = open(tools, |c| match scenario {
-            "arguments" => c.limits.tool_argument_bytes = 2,
-            "concurrent" => c.limits.concurrent_tools = 1,
             "calls" => c.limits.calls = 1,
             "responses" => c.limits.responses = 1,
             "audio" => c.limits.audio_parts = 1,
@@ -678,15 +676,8 @@ async fn bounded_arguments_concurrent_work_and_lifetime_ledgers() {
                 }
             }
             _ => {
-                commit(
-                    &mut peer,
-                    "r",
-                    item("c1", r#"{"value":1,"delay":500}"#, "echo"),
-                )
-                .await;
-                if scenario != "arguments" {
-                    commit(&mut peer, "r", item("c2", r#"{"value":2}"#, "echo")).await;
-                }
+                commit(&mut peer, "r", item("c1", r#"{"value":1}"#, "echo")).await;
+                commit(&mut peer, "r", item("c2", r#"{"value":2}"#, "echo")).await;
             }
         }
         assert!(
@@ -694,6 +685,113 @@ async fn bounded_arguments_concurrent_work_and_lifetime_ledgers() {
             "{scenario}"
         );
         assert!(session.finish().await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn model_overload_fails_only_the_offending_call() {
+    let (tools, mut calls) = registry();
+    let (mut session, mut peer) = open(tools, |c| {
+        c.limits.tool_argument_bytes = 32;
+        c.limits.concurrent_tools = 1;
+    })
+    .await;
+    ready(&mut session, &mut peer).await;
+    created(&mut peer, "r").await;
+    commit(
+        &mut peer,
+        "r",
+        item("slow", r#"{"value":1,"delay":300}"#, "echo"),
+    )
+    .await;
+    assert_eq!(calls.recv().await.unwrap().call_id, "slow");
+    let big = format!(r#"{{"value":1,"pad":"{}"}}"#, "x".repeat(64));
+    for (id, args, expected) in [
+        ("busy", r#"{"value":2}"#, "tool_concurrency_limit"),
+        ("big", big.as_str(), "tool_arguments_too_large"),
+    ] {
+        commit(&mut peer, "r", item(id, args, "echo")).await;
+        let result = recv(&mut peer).await;
+        assert_eq!(result["item"]["call_id"], id);
+        assert_eq!(
+            result["item"]["output"],
+            json!({ "error": expected }).to_string()
+        );
+        acknowledge(&mut peer, &result).await;
+    }
+    // The repeated oversized call is deduplicated, not answered twice.
+    commit(&mut peer, "r", item("big", &big, "echo")).await;
+    let slow = recv(&mut peer).await;
+    assert_eq!(slow["item"]["call_id"], "slow");
+    acknowledge(&mut peer, &slow).await;
+    assert!(calls.try_recv().is_err(), "rejected calls never execute");
+    let output = vec![
+        item("slow", r#"{"value":1,"delay":300}"#, "echo"),
+        item("busy", r#"{"value":2}"#, "echo"),
+        item("big", &big, "echo"),
+    ];
+    done(&mut peer, "r", "completed", output).await;
+    assert_eq!(recv(&mut peer).await["type"], "response.create");
+    assert_eq!(*session.status.borrow(), Status::Ready);
+    session.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn stopping_audio_never_depends_on_truncation_support() {
+    for explicit in [true, false] {
+        let (mut session, mut peer) =
+            open(ToolRegistry::empty(), |c| c.capabilities.truncate = false).await;
+        ready(&mut session, &mut peer).await;
+        created(&mut peer, "r").await;
+        send(&mut peer,json!({"type":"response.output_audio.delta","response_id":"r","item_id":"a","content_index":0,"delta":STANDARD.encode([0u8;4800])})).await;
+        drain_until(&mut session, "response.output_audio.delta").await;
+        let heard = vec![Heard {
+            item_id: "a".into(),
+            content_index: 0,
+            audio_end_ms: 40,
+        }];
+        let response_id = "r".to_owned();
+        session
+            .handle
+            .send(if explicit {
+                Command::Interrupt { response_id, heard }
+            } else {
+                Command::PlaybackStopped { response_id, heard }
+            })
+            .unwrap();
+        if explicit {
+            assert_eq!(recv(&mut peer).await["type"], "response.cancel");
+        }
+        assert!(matches!(
+            event(&mut session).await,
+            Event::PlaybackClear { .. }
+        ));
+        assert!(!session.playback.borrow().allows("r"));
+        quiet(&mut peer).await; // no truncate the endpoint cannot accept
+        // Later audio from the stopped response never reaches the host.
+        send(&mut peer,json!({"type":"response.output_audio.delta","response_id":"r","item_id":"a","content_index":0,"delta":STANDARD.encode([0u8;480])})).await;
+        send(&mut peer, json!({"type":"marker"})).await;
+        assert!(matches!(
+            event(&mut session).await,
+            Event::Server { event } if event["type"] == "marker"
+        ));
+        // Heard positions are still validated.
+        session
+            .handle
+            .send(Command::PlaybackStopped {
+                response_id: "r".into(),
+                heard: vec![Heard {
+                    item_id: "a".into(),
+                    content_index: 0,
+                    audio_end_ms: 999,
+                }],
+            })
+            .unwrap();
+        assert!(matches!(
+            event(&mut session).await,
+            Event::CommandRejected { .. }
+        ));
+        session.finish().await.unwrap();
     }
 }
 

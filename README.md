@@ -104,7 +104,8 @@ send `commit_audio` followed by `respond`.
 - Playback uses actual rendered-sample positions. A separate cancellation watch
   invalidates queued audio even when the event consumer is behind.
 - Queues, tool concurrency, message sizes, and session ledgers are bounded.
-  Connections, writes, tools, and acknowledgements have deadlines.
+  Connections, writes, tools, and acknowledgements have deadlines. A malformed,
+  oversized, or excess tool call gets an error result; the conversation continues.
 - There is no automatic reconnect, write replay, or tool retry. Call deduplication
   lasts for one bounded session; it is not durable exactly-once execution.
 
