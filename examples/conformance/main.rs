@@ -75,9 +75,12 @@ struct Probe {
 }
 
 impl Probe {
-    async fn open(modalities: &[&str], extra: Value, tools: bool) -> Result<Self, Verdict> {
-        let url =
-            std::env::var("REALTIME_URL").map_err(|_| Verdict::Fail("set REALTIME_URL".into()))?;
+    async fn open(
+        url: &str,
+        modalities: &[&str],
+        extra: Value,
+        tools: bool,
+    ) -> Result<Self, Verdict> {
         let mut session = json!({"type":"realtime","output_modalities":modalities});
         if let (Some(session), Some(extra)) = (session.as_object_mut(), extra.as_object()) {
             session.extend(extra.clone());
@@ -85,7 +88,7 @@ impl Probe {
         // Single-session providers may still be releasing the previous check's session.
         let settle = Instant::now() + Duration::from_secs(30);
         let session = loop {
-            let mut config = Config::new(url.clone());
+            let mut config = Config::new(url.to_owned());
             config.model = std::env::var("REALTIME_MODEL").ok();
             config.bearer_token = std::env::var("REALTIME_TOKEN").ok();
             config.limits.initialize_timeout = Duration::from_secs(60);
@@ -152,8 +155,20 @@ impl Probe {
         }
     }
 
-    /// The acknowledgement of the item `matches` accepts.
-    async fn item(&mut self, matches: impl Fn(&Value) -> bool) -> Result<Value, Verdict> {
+    /// The acknowledgement of the item `matches` accepts, seen since `from` or next.
+    async fn item(
+        &mut self,
+        from: usize,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<Value, Verdict> {
+        let acked = |e: &&Value| ITEM_ACK.iter().any(|kind| e["type"] == *kind);
+        if let Some(event) = self.seen[from..]
+            .iter()
+            .filter(acked)
+            .find(|e| matches(&e["item"]))
+        {
+            return Ok(event.clone());
+        }
         loop {
             let event = self.until_any(ITEM_ACK).await?;
             if matches(&event["item"]) {
@@ -244,19 +259,20 @@ fn transcript(probe: &Probe, from: usize, response: &str) -> String {
         .collect()
 }
 
-async fn run(name: &str) -> (Outcome, BTreeSet<String>) {
+async fn run(url: &str, name: &str) -> (Outcome, BTreeSet<String>) {
     let probe = match name {
         "audio_input" => {
             Probe::open(
+                url,
                 TEXT,
                 json!({"audio":{"input":{"turn_detection":null}}}),
                 false,
             )
             .await
         }
-        "audio_truncate" => Probe::open(AUDIO, json!({}), false).await,
-        "tool_call" => Probe::open(TEXT, json!({}), true).await,
-        _ => Probe::open(TEXT, json!({}), false).await,
+        "audio_truncate" => Probe::open(url, AUDIO, json!({}), false).await,
+        "tool_call" => Probe::open(url, TEXT, json!({}), true).await,
+        _ => Probe::open(url, TEXT, json!({}), false).await,
     };
     let mut probe = match probe {
         Ok(probe) => probe,
@@ -296,7 +312,7 @@ fn session(probe: &Probe) -> Outcome {
 async fn text_response(probe: &mut Probe) -> Outcome {
     let from = probe.seen.len();
     probe.send(text("Say hello in three words."))?;
-    probe.item(|item| item["role"] == "user").await?;
+    probe.item(from, |item| item["role"] == "user").await?;
     probe.send(respond(json!({"metadata":{"probe":"text"}})))?;
     let done = probe.until("response.done").await?;
     let response = &done["response"];
@@ -352,10 +368,18 @@ async fn out_of_band(probe: &mut Probe) -> Outcome {
         "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply with only the word banana."}]}],
     })))?;
     let created = probe.until("response.created").await?;
-    check(
-        created["response"].get("conversation_id") == Some(&Value::Null),
-        "out-of-band response.created lacks conversation_id: null",
-    )?;
+    match created["response"].get("conversation_id") {
+        Some(Value::Null) => {}
+        // Optional in the reference, but without it tool calls cannot be attributed.
+        None => {
+            return Err(Verdict::Skip(
+                "response.created omits conversation_id, so the session refuses tool calls \
+                 once out-of-band responses are used"
+                    .into(),
+            ));
+        }
+        Some(other) => return fail(format!("out-of-band conversation_id is {other}")),
+    }
     let done = probe.until("response.done").await?;
     let id = done["response"]["id"].as_str().unwrap_or("");
     check(
@@ -392,10 +416,11 @@ async fn error_event_id(probe: &mut Probe) -> Outcome {
 /// Client-chosen item IDs survive create, retrieve and delete.
 async fn items(probe: &mut Probe) -> Outcome {
     let id = "item_conformance_1";
+    let from = probe.seen.len();
     probe.send(event(json!({"type":"conversation.item.create","item":{
         "id":id,"type":"message","role":"system",
         "content":[{"type":"input_text","text":"The secret word is lighthouse."}]}})))?;
-    probe.item(|item| item["id"] == id).await?;
+    probe.item(from, |item| item["id"] == id).await?;
     probe.send(event(
         json!({"type":"conversation.item.retrieve","item_id":id}),
     ))?;
@@ -416,17 +441,18 @@ async fn tool_call(probe: &mut Probe) -> Outcome {
     ))?;
     probe.send(respond(json!({"tool_choice":"required"})))?;
     let first = probe.until("response.done").await?;
-    let calls: Vec<_> = first["response"]["output"]
+    let calls: Vec<Value> = first["response"]["output"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|item| item["type"] == "function_call")
+        .cloned()
         .collect();
+    check(!calls.is_empty(), "tool_choice required produced no call")?;
     check(
-        calls.len() == 1,
-        "tool_choice required did not produce one call",
+        calls.iter().all(|call| call["name"] == "echo"),
+        "called an unknown tool",
     )?;
-    check(calls[0]["name"] == "echo", "called an unknown tool")?;
     let first_id = first["response"]["id"].as_str().unwrap_or("").to_owned();
     in_order(
         &probe.kinds(from, &first_id),
@@ -436,16 +462,18 @@ async fn tool_call(probe: &mut Probe) -> Outcome {
             "response.done",
         ],
     )?;
-    probe
-        .item(|item| {
-            item["type"] == "function_call_output" && item["call_id"] == calls[0]["call_id"]
-        })
-        .await?;
-    let after = probe.seen.len();
+    // A result may be accepted before or after the response that called for it ends.
+    for call in &calls {
+        probe
+            .item(from, |item| {
+                item["type"] == "function_call_output" && item["call_id"] == call["call_id"]
+            })
+            .await?;
+    }
     let done = probe.until("response.done").await?;
     let id = done["response"]["id"].as_str().unwrap_or("");
     check(
-        transcript(probe, after, id)
+        transcript(probe, from, id)
             .to_lowercase()
             .contains("lighthouse"),
         "continuation did not use the tool result",
@@ -454,6 +482,7 @@ async fn tool_call(probe: &mut Probe) -> Outcome {
 
 /// Manual commit and clear, with turn detection disabled.
 async fn audio_input(probe: &mut Probe) -> Outcome {
+    let from = probe.seen.len();
     let silence = STANDARD.encode(vec![0u8; 24_000 * 2 / 5]);
     probe.send(Command::Audio {
         audio: silence.clone(),
@@ -464,7 +493,7 @@ async fn audio_input(probe: &mut Probe) -> Outcome {
     probe.send(Command::CommitAudio)?;
     let committed = probe.until("input_audio_buffer.committed").await?;
     probe
-        .item(|item| item["id"] == committed["item_id"])
+        .item(from, |item| item["id"] == committed["item_id"])
         .await?;
     Ok(())
 }
@@ -519,39 +548,71 @@ async fn audio_truncate(probe: &mut Probe) -> Outcome {
     )
 }
 
+/// The requested checks in canonical order, or the first unknown name.
+fn select(requested: &[String]) -> Result<Vec<&'static str>, String> {
+    if let Some(unknown) = requested.iter().find(|r| !CHECKS.contains(&r.as_str())) {
+        return Err(format!(
+            "unknown check {unknown}; checks: {}",
+            CHECKS.join(", ")
+        ));
+    }
+    Ok(CHECKS
+        .iter()
+        .copied()
+        .filter(|c| requested.is_empty() || requested.iter().any(|r| r == c))
+        .collect())
+}
+
+/// Conformant only when every check ran and passed, which still covers only these flows.
+fn summary(results: &[&str], nonstandard: &BTreeSet<String>) -> Value {
+    let count = |kind| results.iter().filter(|r| **r == kind).count();
+    let passed = count("pass");
+    json!({
+        "selected":results.len(),"passed":passed,"failed":count("fail"),"skipped":count("skip"),
+        "conformant":results.len() == CHECKS.len() && passed == CHECKS.len(),
+        "nonstandard_events":nonstandard,
+    })
+}
+
 #[tokio::main]
 async fn main() {
-    if std::env::args().any(|arg| arg == "--help") {
+    let requested: Vec<String> = std::env::args().skip(1).collect();
+    if requested.iter().any(|arg| arg == "--help") {
         println!(
             "Usage: cargo run --locked --example conformance [CHECK...]\nSet REALTIME_URL; optional REALTIME_MODEL and REALTIME_TOKEN.\nChecks: {}",
             CHECKS.join(", ")
         );
         return;
     }
-    let requested: Vec<String> = std::env::args().skip(1).collect();
-    let mut failed = false;
-    let mut unknown = BTreeSet::new();
-    for name in CHECKS
-        .iter()
-        .filter(|c| requested.is_empty() || requested.iter().any(|r| r == *c))
-    {
-        let (outcome, seen) = run(name).await;
-        unknown.extend(seen);
+    let (selected, url) = match (select(&requested), std::env::var("REALTIME_URL")) {
+        (Ok(selected), Ok(url)) => (selected, url),
+        (Err(error), _) => usage(&error),
+        (_, Err(_)) => usage("set REALTIME_URL"),
+    };
+    let mut results = Vec::new();
+    let mut nonstandard = BTreeSet::new();
+    for name in selected {
+        let (outcome, seen) = run(&url, name).await;
+        nonstandard.extend(seen);
         let (result, detail) = match outcome {
             Ok(()) => ("pass", None),
             Err(Verdict::Skip(why)) => ("skip", Some(why)),
-            Err(Verdict::Fail(why)) => {
-                failed = true;
-                ("fail", Some(why))
-            }
+            Err(Verdict::Fail(why)) => ("fail", Some(why)),
         };
+        results.push(result);
         println!("{}", json!({"check":name,"result":result,"detail":detail}));
     }
-    println!(
-        "{}",
-        json!({"conformant":!failed,"nonstandard_events":unknown})
-    );
-    if failed {
+    println!("{}", summary(&results, &nonstandard));
+    // Success means every selected check passed; a skip establishes nothing.
+    if results.iter().any(|r| *r != "pass") {
         std::process::exit(1);
     }
 }
+
+fn usage(error: &str) -> ! {
+    eprintln!("{error}");
+    std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests;

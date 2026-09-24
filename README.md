@@ -143,8 +143,10 @@ tool calls, manual audio commit/clear, and truncation of heard audio:
 cargo run --locked --example conformance            # or name individual checks
 ```
 
-It prints one JSON line per check (`pass`, `fail`, or `skip` with a reason) and exits
-non-zero on any failure. Passing covers these flows, not the whole reference.
+It prints one JSON line per check (`pass`, `fail`, or `skip` with a reason), then a
+summary with counts. It exits 0 only if every selected check passed, and reports
+`conformant` only when all checks ran and passed. That covers these flows, not the
+whole reference.
 
 ## Compatibility and scope
 

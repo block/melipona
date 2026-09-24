@@ -189,8 +189,9 @@ pub(crate) async fn connect(
 #[derive(Default)]
 struct Response {
     created: bool,
-    /// Outside the default conversation: never gates it, and its calls are not executed.
-    out_of_band: bool,
+    /// The reported `conversation_id`: `Some(false)` when null (out-of-band: never
+    /// gates the default conversation, calls never execute), `Some(true)` when set.
+    conversation: Option<bool>,
     done: bool,
     successful: bool,
     cancelled: bool,
@@ -245,6 +246,9 @@ struct Coordinator {
     received: Instant,
     ping_sent: bool,
     oversized_key: RandomState,
+    /// Once out-of-band responses exist, only calls from a response that reports its
+    /// conversation may execute.
+    out_of_band_requested: bool,
 }
 
 type Socket =
@@ -294,6 +298,7 @@ async fn run(
         received: now,
         ping_sent: false,
         oversized_key: RandomState::new(),
+        out_of_band_requested: false,
     };
     let mut writer_joined = false;
     let mut result = async {
@@ -468,6 +473,7 @@ impl Coordinator {
         }
         if out_of_band {
             // Parallel by design; the host correlates it through its own metadata.
+            self.out_of_band_requested = true;
             return self.send(event);
         }
         if !self.active.is_empty() || self.create_id.is_some() {
@@ -790,13 +796,13 @@ impl Coordinator {
             }
             "response.created" => {
                 let rid = field(&event["response"], "id")?;
-                let out_of_band = out_of_band(&event["response"]);
+                let conversation = conversation(&event["response"]);
                 let state = self.response(rid)?;
                 if !state.created {
                     state.created = true;
-                    state.out_of_band |= out_of_band;
+                    state.conversation = state.conversation.or(conversation);
                     let in_progress = !state.done;
-                    if !out_of_band {
+                    if conversation != Some(false) {
                         if in_progress {
                             self.active.insert(rid.to_owned());
                         }
@@ -853,7 +859,7 @@ impl Coordinator {
                 let rid = field(response, "id")?;
                 let completed = response["status"] == "completed";
                 let state = self.response(rid)?;
-                state.out_of_band |= out_of_band(response);
+                state.conversation = state.conversation.or(conversation(response));
                 let was_cancelled = state.cancelled;
                 if completed
                     && !was_cancelled
@@ -918,8 +924,16 @@ impl Coordinator {
     }
     fn admit(&mut self, rid: &str, item: &Value) -> Result<(), Error> {
         let response = self.response(rid)?;
-        if response.cancelled || response.out_of_band {
+        let (cancelled, conversation) = (response.cancelled, response.conversation);
+        if cancelled || conversation == Some(false) {
             return Ok(());
+        }
+        if self.out_of_band_requested && conversation.is_none() {
+            // Executing a call the host may have scoped out of band is not recoverable.
+            return Err(Error::Protocol(
+                "tool call from a response without conversation_id after an out-of-band request"
+                    .into(),
+            ));
         }
         let call_id = field(item, "call_id")?.to_owned();
         let name = field(item, "name")?.to_owned();
@@ -1055,7 +1069,11 @@ impl Coordinator {
     }
 }
 
-/// GA marks an out-of-band response with a null `conversation_id`.
-fn out_of_band(response: &Value) -> bool {
-    response.get("conversation_id").is_some_and(Value::is_null)
+/// GA reports a null `conversation_id` for an out-of-band response.
+fn conversation(response: &Value) -> Option<bool> {
+    match response.get("conversation_id") {
+        Some(Value::Null) => Some(false),
+        Some(Value::String(_)) => Some(true),
+        _ => None,
+    }
 }

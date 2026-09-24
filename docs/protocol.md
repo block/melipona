@@ -51,7 +51,9 @@ A response with `"conversation": "none"` is out-of-band: it runs in parallel, ma
 declare its own tools, and is recognized by the null `conversation_id` the server
 reports for it. Its function calls are returned to the host in `response.done`
 and never executed, because their results would have no conversation to join.
-Correlate out-of-band responses through their `metadata`.
+Once a session has requested an out-of-band response, a tool call from a response
+that reports no `conversation_id` ends the session instead of executing, because
+its owner is unknown. Correlate out-of-band responses through their `metadata`.
 
 Controls have independent bounded admission and an urgent socket lane. They can
 overtake queued media, but not a frame already being written. Audio/commit retain

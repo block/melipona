@@ -1368,8 +1368,32 @@ async fn respond_parameters_and_parallel_out_of_band_responses() {
     let cancel = recv(&mut peer).await;
     assert_eq!(cancel["type"], "response.cancel");
     assert_eq!(cancel["response_id"], "o2");
+
+    // The default conversation's calls still execute beside out-of-band responses.
+    commit(&mut peer, "r", item("d", r#"{"value":2}"#, "echo")).await;
+    assert_eq!(calls.recv().await.unwrap().call_id, "d");
     assert_eq!(*session.status.borrow(), Status::Ready);
     session.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn unattributable_calls_after_out_of_band_requests_never_execute() {
+    let (tools, mut calls) = registry();
+    let (mut session, mut peer) = start(tools).await;
+    session
+        .handle
+        .send(Command::Respond {
+            response: Some(json!({"conversation":"none"})),
+        })
+        .unwrap();
+    recv(&mut peer).await;
+    created(&mut peer, "o").await; // No conversation_id: ownership is unknown.
+    commit(&mut peer, "o", item("c", r#"{"value":1}"#, "echo")).await;
+    assert!(matches!(
+        failed(&mut session).await,
+        Error::Protocol(e) if e.contains("without conversation_id")
+    ));
+    assert!(calls.try_recv().is_err());
 }
 
 #[tokio::test]

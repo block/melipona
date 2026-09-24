@@ -194,7 +194,8 @@ pub enum Command {
     /// Requests a response; `response` holds optional `response.create` parameters.
     /// With `"conversation": "none"` it is out-of-band: it may run beside the default
     /// conversation's response, may declare its own tools, and its tool calls are
-    /// returned to the host in `response.done`, never executed.
+    /// returned to the host in `response.done`, never executed. After one, calls from a
+    /// response that reports no `conversation_id` end the session instead.
     Respond {
         #[serde(default)]
         response: Option<Value>,
