@@ -567,6 +567,7 @@ async fn explicit_overlap_after_generation_done_uses_heard_samples() {
 #[tokio::test]
 async fn speech_started_never_cancels_by_itself() {
     let (mut session, mut peer) = open().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         next(&mut peer).await;
         next(&mut peer).await;
@@ -591,11 +592,12 @@ async fn speech_started_never_cancels_by_itself() {
             json!({"type":"response.done","response":{"id":"r","status":"completed","output":[]}}),
         )
         .await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(350), peer.next())
-                .await
-                .is_err()
-        );
+        // Keep the peer alive for the whole playback/settle cycle. A fixed
+        // sleep races the virtual player on slower machines.
+        tokio::select! {
+            _ = stopped => {},
+            message = peer.next() => panic!("unexpected client write: {message:?}"),
+        }
     });
     let (_tx, mut receipts) = mpsc::channel(1);
     let (mut log, path) = evidence();
@@ -614,6 +616,7 @@ async fn speech_started_never_cancels_by_itself() {
     .unwrap();
     assert_eq!(m.outcome, "pass");
     assert_eq!(m.rendered_audio_ms, 256);
+    stop.send(()).unwrap();
     server.await.unwrap();
     session.finish().await.ok();
     drop(log);
