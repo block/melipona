@@ -14,6 +14,9 @@ type Peer = WebSocketStream<TcpStream>;
 struct Executor(mpsc::Sender<ToolCall>);
 impl ToolExecutor for Executor {
     fn execute(&self, call: ToolCall, _: ToolCancellation) -> ToolFuture<'_> {
+        if call.name == "construct_panic" {
+            panic!("synthetic panic while building the future");
+        }
         Box::pin(async move {
             let _ = self.0.try_send(call.clone());
             if call.name == "panic" {
@@ -34,7 +37,7 @@ impl ToolExecutor for Executor {
 }
 fn registry() -> (ToolRegistry, mpsc::Receiver<ToolCall>) {
     let (tx, rx) = mpsc::channel(32);
-    let definitions=["echo","fail","panic","large"].into_iter().map(|name|Tool{name:name.into(),description:"Synthetic test tool".into(),
+    let definitions=["echo","fail","panic","construct_panic","large"].into_iter().map(|name|Tool{name:name.into(),description:"Synthetic test tool".into(),
         parameters:json!({"type":"object","properties":{"value":{"type":"integer"},"delay":{"type":"integer","minimum":0}},"required":["value"],"additionalProperties":false})
     }).collect();
     (
@@ -380,6 +383,12 @@ async fn malformed_schema_failing_and_panicking_tools_return_results() {
         ("unknown", r#"{"value":1}"#, "missing", "unknown_tool"),
         ("failure", r#"{"value":1}"#, "fail", "synthetic failure"),
         ("panic", r#"{"value":1}"#, "panic", "tool_panicked"),
+        (
+            "construct",
+            r#"{"value":1}"#,
+            "construct_panic",
+            "tool_panicked",
+        ),
     ] {
         commit(&mut peer, "r", item(id, args, name)).await;
         let result = recv(&mut peer).await;
@@ -734,6 +743,35 @@ async fn model_overload_fails_only_the_offending_call() {
     assert_eq!(recv(&mut peer).await["type"], "response.create");
     assert_eq!(*session.status.borrow(), Status::Ready);
     session.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_duplicate_with_different_bytes_is_a_conflict() {
+    let (tools, mut calls) = registry();
+    let (mut session, mut peer) = open(tools, |c| c.limits.tool_argument_bytes = 16).await;
+    ready(&mut session, &mut peer).await;
+    created(&mut peer, "r").await;
+    let (first, second) = (r#"{"value":1111111111}"#, r#"{"value":2222222222}"#);
+    assert_eq!(first.len(), second.len());
+    commit(&mut peer, "r", item("c", first, "echo")).await;
+    let result = recv(&mut peer).await;
+    assert_eq!(
+        result["item"]["output"],
+        json!({ "error": "tool_arguments_too_large" }).to_string()
+    );
+    acknowledge(&mut peer, &result).await;
+    commit(&mut peer, "r", item("c", second, "echo")).await;
+    let failed = session.status.wait_for(|s| matches!(s, Status::Failed(_)));
+    timeout(Duration::from_secs(3), failed)
+        .await
+        .expect("changed bytes must fail the session")
+        .unwrap();
+    assert!(matches!(
+        session.status.borrow().clone(),
+        Status::Failed(Error::Protocol(e)) if e.contains("conflicting duplicate")
+    ));
+    assert!(calls.try_recv().is_err());
+    assert!(session.finish().await.is_err());
 }
 
 #[tokio::test]

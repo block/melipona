@@ -4,6 +4,7 @@ use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
+    hash::{BuildHasher, RandomState},
     panic::AssertUnwindSafe,
 };
 use tokio::{
@@ -241,6 +242,7 @@ struct Coordinator {
     create_id: Option<(String, Instant)>,
     received: Instant,
     ping_sent: bool,
+    oversized_key: RandomState,
 }
 
 type Socket =
@@ -289,6 +291,7 @@ async fn run(
         create_id: None,
         received: now,
         ping_sent: false,
+        oversized_key: RandomState::new(),
     };
     let mut writer_joined = false;
     let mut result = async {
@@ -382,7 +385,11 @@ async fn execute(
     limit: Duration,
 ) -> ToolResult {
     let call_id = call.call_id.clone();
-    let work = AssertUnwindSafe(registry.executor.execute(call, cancel.clone())).catch_unwind();
+    let token = cancel.clone();
+    // The executor is invoked on first poll, inside the guard: a panic while building
+    // its future is a per-call result, like a panic while polling it.
+    let work = AssertUnwindSafe(async move { registry.executor.execute(call, token).await })
+        .catch_unwind();
     let result = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -870,7 +877,12 @@ impl Coordinator {
         let fingerprint = match &parsed {
             Some(Ok(value)) => value.to_string(),
             Some(Err(_)) => raw.to_owned(),
-            None => format!("oversized:{}", raw.len()),
+            // Rejected input is compared by raw bytes through a per-session keyed hash.
+            None => format!(
+                "oversized:{}:{:016x}",
+                raw.len(),
+                self.oversized_key.hash_one(raw)
+            ),
         };
         if let Some(existing) = self.calls.get(&call_id) {
             if existing.response != rid

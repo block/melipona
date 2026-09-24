@@ -236,7 +236,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolState {
-    /// The call is committed; exactly one result follows in this session.
+    /// The call is committed; exactly one result follows unless the session ends first.
     Admitted,
     /// Its result or error was sent as a function_call_output item.
     ResultSent,

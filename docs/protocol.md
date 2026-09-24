@@ -4,8 +4,10 @@
   Fragments and `function_call_arguments.done` alone never dispatch it.
   Completed `response.done` output reconciles missing item events.
 - Identical call IDs and canonical arguments execute once per session.
-  Conflicting arguments/name/response owner fail the session. This is bounded
-  session deduplication, not durable exactly-once execution.
+  Conflicting arguments/name/response owner fail the session. Oversized
+  arguments are never parsed, so they compare by raw bytes through a per-session
+  keyed hash. This is bounded session deduplication, not durable exactly-once
+  execution.
 - A model mistake fails only its own call. Invalid JSON, schema violations,
   unknown tools, arguments over the size limit and calls beyond the concurrency
   limit each receive an error result without executing; the session continues.
@@ -39,8 +41,9 @@ terminate instead of silently dropping audio or accumulating stale playback.
 
 Defaults: 64 ordinary messages per queue, 8 priority commands, 16 priority writes,
 64 KiB per encoded audio chunk, 8 MiB per message, 16 concurrent tools, 64 KiB tool
-arguments/results, 4,096 lifetime calls/audio parts and 8,192 responses. Only
-the lifetime ledgers and host-side queues end a session when exhausted. Large
+arguments/results, 4,096 lifetime calls/audio parts and 8,192 responses. Tool
+argument and concurrency limits fail one call; exhausting a lifetime ledger, a
+queue, or a message, audio chunk or audio duration bound ends the session. Large
 images can still occupy the message-size bound per slot; tune `Limits` for your
 host and use small paced audio frames. Lifetime ledgers retain IDs until the
 session ends at their cap.
