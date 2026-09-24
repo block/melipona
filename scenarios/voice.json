@@ -1,0 +1,28 @@
+{
+  "name": "persistent-voice-and-tool-soak",
+  "rounds": 10,
+  "session": {
+    "type": "realtime",
+    "output_modalities": ["audio"],
+    "max_output_tokens": 512,
+    "audio": {"input": {"turn_detection": null}},
+    "instructions": "Speak unformatted text. Use the echo tool only when explicitly requested, once per request."
+  },
+  "turns": [
+    {
+      "name": "spoken-question",
+      "pcm": "fixtures/question.pcm",
+      "expect": {"contains": ["four"]}
+    },
+    {
+      "name": "long-spoken-answer",
+      "text": "Describe an imaginary garden in one paragraph of about sixty words.",
+      "expect": {"min_words": 30}
+    },
+    {
+      "name": "spoken-tool-result",
+      "text": "Call echo exactly once with text lighthouse, then say the returned word.",
+      "expect": {"contains": ["lighthouse"], "tool_texts": ["lighthouse"]}
+    }
+  ]
+}

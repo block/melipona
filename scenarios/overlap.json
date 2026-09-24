@@ -1,0 +1,24 @@
+{
+  "name": "backchannel-and-floor-taking",
+  "rounds": 5,
+  "session": {
+    "type": "realtime",
+    "output_modalities": ["audio"],
+    "max_output_tokens": 512,
+    "audio": {"input": {"turn_detection": {"type": "server_vad", "create_response": true, "interrupt_response": true}}}
+  },
+  "turns": [
+    {
+      "name": "backchannel",
+      "text": "Describe an imaginary garden in one paragraph of about eighty words.",
+      "overlap": {"pcm": "fixtures/acknowledgement.pcm", "after_played_ms": 1024, "expect_clear": false},
+      "expect": {"min_words": 40}
+    },
+    {
+      "name": "interruption",
+      "text": "Describe an imaginary garden in one paragraph of about eighty words.",
+      "overlap": {"pcm": "fixtures/correction.pcm", "after_played_ms": 1024, "expect_clear": true},
+      "expect": {"contains": ["six"], "max_stop_ms": 400}
+    }
+  ]
+}

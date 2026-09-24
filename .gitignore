@@ -1,0 +1,19 @@
+/target/
+/.tools/
+.env
+*.log
+.env.*
+!.env.example
+
+/scenarios/fixtures/
+
+# Local recordings and qualification output are never source fixtures.
+*.pcm
+*.wav
+*.aiff
+*.mp3
+*.gguf
+*.safetensors
+events.jsonl
+summary.json
+.DS_Store
