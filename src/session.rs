@@ -189,6 +189,8 @@ pub(crate) async fn connect(
 #[derive(Default)]
 struct Response {
     created: bool,
+    /// Outside the default conversation: never gates it, and its calls are not executed.
+    out_of_band: bool,
     done: bool,
     successful: bool,
     cancelled: bool,
@@ -446,19 +448,62 @@ impl Coordinator {
         }
         Ok(self.responses.entry(rid.to_owned()).or_default())
     }
-    fn create_response(&mut self) -> Result<(), Error> {
+    fn create_response(&mut self, parameters: Option<Value>) -> Result<(), Error> {
+        let mut event = json!({"type":"response.create","event_id":id()});
+        let out_of_band = parameters
+            .as_ref()
+            .is_some_and(|p| p["conversation"] == "none");
+        if let Some(parameters) = parameters {
+            if !parameters.is_object() {
+                return Err(Error::Config(
+                    "response parameters must be an object".into(),
+                ));
+            }
+            if !out_of_band && parameters.get("tools").is_some() {
+                return Err(Error::Config(
+                    "default-conversation responses use the tool registry".into(),
+                ));
+            }
+            event["response"] = parameters;
+        }
+        if out_of_band {
+            // Parallel by design; the host correlates it through its own metadata.
+            return self.send(event);
+        }
         if !self.active.is_empty() || self.create_id.is_some() {
             return Err(Error::Protocol(
                 "response already active or requested".into(),
             ));
         }
-        let event_id = id();
-        self.send(json!({"type":"response.create","event_id":event_id}))?;
+        let event_id = event["event_id"].as_str().expect("set above").to_owned();
+        self.send(event)?;
         self.create_id = Some((
             event_id,
             Instant::now() + self.config.limits.acknowledgement_timeout,
         ));
         Ok(())
+    }
+    /// Forwards a client event whose state the harness does not own.
+    fn forward(&mut self, event: Value) -> Result<(), Error> {
+        let kind = field(&event, "type")?;
+        let owner = match kind {
+            "response.create" => Some("the respond command"),
+            "response.cancel" | "conversation.item.truncate" => {
+                Some("the interrupt and playback_stopped commands")
+            }
+            "conversation.item.create" if event["item"]["type"] == "function_call_output" => {
+                Some("the tool registry")
+            }
+            "session.update" if event["session"].get("tools").is_some() => {
+                Some("the tool registry")
+            }
+            _ if kind.starts_with("frankie.") => Some("the frankie command"),
+            _ => None,
+        };
+        if let Some(owner) = owner {
+            return Err(Error::Config(format!("{kind} is owned by {owner}")));
+        }
+        self.send(event)
     }
     /// Returns false when the host closed the session. A caller mistake rejects only
     /// that command; resource and transport failures end the session.
@@ -557,11 +602,16 @@ impl Coordinator {
             }
             Command::CommitAudio => self.send(json!({"type":"input_audio_buffer.commit"}))?,
             Command::ClearAudio => self.send(json!({"type":"input_audio_buffer.clear"}))?,
-            Command::Respond => self.create_response()?,
+            Command::Respond { response } => self.create_response(response)?,
+            Command::Event { event } => self.forward(event)?,
             Command::Interrupt { response_id, heard } => {
                 // Validate every position before issuing any cancellation or truncation.
                 self.validate_heard(&response_id, &heard)?;
-                if self.active.contains(&response_id) {
+                if self
+                    .responses
+                    .get(&response_id)
+                    .is_some_and(|r| r.created && !r.done)
+                {
                     self.send(json!({"type":"response.cancel","response_id":response_id}))?;
                 }
                 self.clear_playback(&response_id)?;
@@ -740,13 +790,18 @@ impl Coordinator {
             }
             "response.created" => {
                 let rid = field(&event["response"], "id")?;
+                let out_of_band = out_of_band(&event["response"]);
                 let state = self.response(rid)?;
                 if !state.created {
                     state.created = true;
-                    if !state.done {
-                        self.active.insert(rid.to_owned());
+                    state.out_of_band |= out_of_band;
+                    let in_progress = !state.done;
+                    if !out_of_band {
+                        if in_progress {
+                            self.active.insert(rid.to_owned());
+                        }
+                        self.create_id = None;
                     }
-                    self.create_id = None;
                 }
             }
             "response.output_audio.delta" => {
@@ -797,7 +852,9 @@ impl Coordinator {
                 let response = &event["response"];
                 let rid = field(response, "id")?;
                 let completed = response["status"] == "completed";
-                let was_cancelled = self.response(rid)?.cancelled;
+                let state = self.response(rid)?;
+                state.out_of_band |= out_of_band(response);
+                let was_cancelled = state.cancelled;
                 if completed
                     && !was_cancelled
                     && let Some(output) = response["output"].as_array()
@@ -860,7 +917,8 @@ impl Coordinator {
         self.emit(Event::Server { event })
     }
     fn admit(&mut self, rid: &str, item: &Value) -> Result<(), Error> {
-        if self.response(rid)?.cancelled {
+        let response = self.response(rid)?;
+        if response.cancelled || response.out_of_band {
             return Ok(());
         }
         let call_id = field(item, "call_id")?.to_owned();
@@ -988,11 +1046,16 @@ impl Coordinator {
             .map(|(id, _)| id.clone())
             .collect();
         if !ready.is_empty() {
-            self.create_response()?;
+            self.create_response(None)?;
             for id in ready {
                 self.responses.get_mut(&id).expect("known").continued = true;
             }
         }
         Ok(())
     }
+}
+
+/// GA marks an out-of-band response with a null `conversation_id`.
+fn out_of_band(response: &Value) -> bool {
+    response.get("conversation_id").is_some_and(Value::is_null)
 }

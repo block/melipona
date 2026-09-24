@@ -328,7 +328,7 @@ impl<'a> TurnRun<'a> {
         };
         let input_done = loaded.input.is_empty();
         if input_done {
-            send(session, Command::Respond)?;
+            send(session, Command::Respond { response: None })?;
             m.input_end_ms = Some(ms(start));
         }
         let recording = if spec.record_audio {
@@ -527,7 +527,7 @@ impl<'a> TurnRun<'a> {
             )?;
             if !self.turn.server_vad {
                 send(self.session, Command::CommitAudio)?;
-                send(self.session, Command::Respond)?;
+                send(self.session, Command::Respond { response: None })?;
             }
         }
         Ok(())
@@ -622,7 +622,7 @@ impl<'a> TurnRun<'a> {
             "response.output_text.delta" | "response.output_audio_transcript.delta" => {
                 self.public_text(kind, &event)?;
             }
-            "conversation.item.created" | "conversation.item.added" => {
+            "conversation.item.created" | "conversation.item.added" | "conversation.item.done" => {
                 if event["item"]["type"] == "function_call_output"
                     && let Some(id) = event["item"]["call_id"].as_str()
                 {

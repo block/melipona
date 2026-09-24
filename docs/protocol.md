@@ -34,6 +34,25 @@
   needs an explicit interruption when its turn policy requires it. A generic
   client cannot infer whether a short utterance is a backchannel.
 
+## Client events
+
+The harness owns the state behind `response.create`, `response.cancel`,
+`conversation.item.truncate`, `function_call_output` items and `session.tools`;
+use `respond`, `interrupt`/`playback_stopped` and the tool registry for them.
+`event` forwards any other client event unchanged and rejects those, so
+`session.update`, arbitrary `conversation.item.create` items (system messages,
+`previous_item_id`, MCP approval responses), `conversation.item.delete` and
+`conversation.item.retrieve` remain available. `output_audio_buffer.clear` is
+WebRTC/SIP only and does not apply to WebSocket sessions.
+
+`respond` forwards optional `response.create` parameters. The default
+conversation admits one response at a time and always uses the registry's tools.
+A response with `"conversation": "none"` is out-of-band: it runs in parallel, may
+declare its own tools, and is recognized by the null `conversation_id` the server
+reports for it. Its function calls are returned to the host in `response.done`
+and never executed, because their results would have no conversation to join.
+Correlate out-of-band responses through their `metadata`.
+
 Controls have independent bounded admission and an urgent socket lane. They can
 overtake queued media, but not a frame already being written. Audio/commit retain
 ordinary FIFO order. Full command queues reject admission; full internal queues

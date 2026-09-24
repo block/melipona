@@ -555,7 +555,10 @@ async fn busy_respond_rejected_without_tearing_down_session() {
     let (mut session, mut peer) = start(ToolRegistry::empty()).await;
     created(&mut peer, "r").await;
     drain_until(&mut session, "response.created").await;
-    session.handle.send(Command::Respond).unwrap();
+    session
+        .handle
+        .send(Command::Respond { response: None })
+        .unwrap();
     assert!(matches!(
         event(&mut session).await,
         Event::CommandRejected { .. }
@@ -1289,5 +1292,132 @@ async fn interrupt_has_independent_admission_behind_queued_audio() {
         .unwrap();
     assert_eq!(recv(&mut peer).await["type"], "response.cancel");
     assert!(!session.playback.borrow().allows("r"));
+    session.finish().await.unwrap();
+}
+
+async fn rejected(session: &mut Session) -> String {
+    loop {
+        match event(session).await {
+            Event::CommandRejected { error } => return error,
+            Event::Server { .. } => {}
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn respond_parameters_and_parallel_out_of_band_responses() {
+    let bare: Command = serde_json::from_str(r#"{"command":"respond"}"#).unwrap();
+    assert!(matches!(bare, Command::Respond { response: None }));
+    let (tools, mut calls) = registry();
+    let (mut session, mut peer) = start(tools).await;
+    let respond = |response: Value| Command::Respond {
+        response: Some(response),
+    };
+    session
+        .handle
+        .send(respond(json!({"instructions":"Be brief."})))
+        .unwrap();
+    let create = recv(&mut peer).await;
+    assert_eq!(create["type"], "response.create");
+    assert_eq!(create["response"]["instructions"], "Be brief.");
+    send(&mut peer,json!({"type":"response.created","response":{"id":"r","status":"in_progress","conversation_id":"conv_1"}})).await;
+    drain_until(&mut session, "response.created").await;
+
+    // The default conversation admits one response; an out-of-band one runs beside it.
+    session
+        .handle
+        .send(Command::Respond { response: None })
+        .unwrap();
+    assert!(rejected(&mut session).await.contains("already active"));
+    let tool = json!({"type":"function","name":"classify","parameters":{"type":"object"}});
+    session
+        .handle
+        .send(respond(json!({"tools":[tool.clone()]})))
+        .unwrap();
+    assert!(rejected(&mut session).await.contains("tool registry"));
+    session
+        .handle
+        .send(respond(
+            json!({"conversation":"none","metadata":{"topic":"x"},"tools":[tool]}),
+        ))
+        .unwrap();
+    let side = recv(&mut peer).await;
+    assert_eq!(side["response"]["conversation"], "none");
+    assert_eq!(side["response"]["tools"][0]["name"], "classify");
+
+    // Its calls go back to the host; nothing executes and no result is written.
+    send(&mut peer,json!({"type":"response.created","response":{"id":"o","status":"in_progress","conversation_id":null}})).await;
+    let call = item("c", r#"{"value":1}"#, "echo");
+    commit(&mut peer, "o", call.clone()).await;
+    send(&mut peer,json!({"type":"response.done","response":{"id":"o","status":"completed","conversation_id":null,"output":[call]}})).await;
+    drain_until(&mut session, "response.done").await;
+    quiet(&mut peer).await;
+    assert!(calls.try_recv().is_err());
+
+    // Interrupting an out-of-band response still cancels it.
+    send(&mut peer,json!({"type":"response.created","response":{"id":"o2","status":"in_progress","conversation_id":null}})).await;
+    drain_until(&mut session, "response.created").await;
+    session
+        .handle
+        .send(Command::Interrupt {
+            response_id: "o2".into(),
+            heard: vec![],
+        })
+        .unwrap();
+    let cancel = recv(&mut peer).await;
+    assert_eq!(cancel["type"], "response.cancel");
+    assert_eq!(cancel["response_id"], "o2");
+    assert_eq!(*session.status.borrow(), Status::Ready);
+    session.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn events_are_forwarded_unless_the_harness_owns_their_state() {
+    let (mut session, mut peer) = start(ToolRegistry::empty()).await;
+    for event in [
+        json!({"type":"session.update","session":{"type":"realtime","instructions":"Speak French."}}),
+        json!({"type":"conversation.item.create","previous_item_id":"root","item":{"type":"message","role":"system","content":[{"type":"input_text","text":"Be kind."}]}}),
+        json!({"type":"conversation.item.create","item":{"type":"mcp_approval_response","approval_request_id":"a","approve":true}}),
+        json!({"type":"conversation.item.delete","item_id":"i"}),
+        json!({"type":"conversation.item.retrieve","item_id":"i"}),
+    ] {
+        session
+            .handle
+            .send(Command::Event {
+                event: event.clone(),
+            })
+            .unwrap();
+        let mut sent = recv(&mut peer).await;
+        assert!(sent["event_id"].is_string());
+        sent.as_object_mut().unwrap().remove("event_id");
+        assert_eq!(sent, event);
+    }
+    for (event, owner) in [
+        (json!({"type":"response.create"}), "respond"),
+        (json!({"type":"response.cancel"}), "interrupt"),
+        (
+            json!({"type":"conversation.item.truncate","item_id":"i","content_index":0,"audio_end_ms":0}),
+            "interrupt",
+        ),
+        (
+            json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"c","output":"{}"}}),
+            "tool registry",
+        ),
+        (
+            json!({"type":"session.update","session":{"type":"realtime","tools":[]}}),
+            "tool registry",
+        ),
+        (
+            json!({"type":"frankie.playback.finished","item_id":"i","response_id":"r","audio_end_ms":0}),
+            "frankie",
+        ),
+        (json!({"item_id":"i"}), "type"),
+    ] {
+        session.handle.send(Command::Event { event }).unwrap();
+        assert!(rejected(&mut session).await.contains(owner));
+    }
+    quiet(&mut peer).await;
+    assert_eq!(*session.status.borrow(), Status::Ready);
     session.finish().await.unwrap();
 }

@@ -191,7 +191,20 @@ pub enum Command {
     },
     CommitAudio,
     ClearAudio,
-    Respond,
+    /// Requests a response; `response` holds optional `response.create` parameters.
+    /// With `"conversation": "none"` it is out-of-band: it may run beside the default
+    /// conversation's response, may declare its own tools, and its tool calls are
+    /// returned to the host in `response.done`, never executed.
+    Respond {
+        #[serde(default)]
+        response: Option<Value>,
+    },
+    /// Any other Realtime client event, sent as-is. Events whose state the harness owns
+    /// are rejected: responses, cancellation, truncation, tool results and tools,
+    /// and Frankie extensions each have their own command or configuration.
+    Event {
+        event: Value,
+    },
     /// Stop the consumer's player first, then submit its final sample-clock positions.
     /// Speech cancellation does not cancel tools.
     Interrupt {
@@ -264,7 +277,9 @@ impl Handle {
     pub fn send(&self, command: Command) -> Result<(), Error> {
         let oversized_audio = match &command {
             Command::Audio { audio } => audio.len() > self.max_audio_bytes,
-            Command::Frankie { event } if event["type"] == "input_audio_buffer.append" => {
+            Command::Frankie { event } | Command::Event { event }
+                if event["type"] == "input_audio_buffer.append" =>
+            {
                 ["audio", "playback"].iter().any(|key| {
                     event[*key]
                         .as_str()

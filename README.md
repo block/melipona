@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.session = json!({"type":"realtime", "output_modalities":["text"]});
     let mut session = Session::connect(config, ToolRegistry::empty()).await?;
     session.handle.send(Command::Text { text: "Hello".into() })?;
-    session.handle.send(Command::Respond)?;
+    session.handle.send(Command::Respond { response: None })?;
 
     while let Some(event) = session.events.recv().await {
         if let Event::Server { event } = event {
@@ -91,7 +91,9 @@ executor owns authorization and side effects. Blocking work belongs in
 
 Commands also support base64 audio chunks, manual audio commit/clear, images,
 response interruption with heard-audio positions, and individual tool cancellation.
-Text and image insertion do not implicitly request a response. With server VAD,
+`respond` accepts any `response.create` parameters, including parallel out-of-band
+responses, and `event` forwards any other Realtime client event, so every GA client
+event is reachable. Text and image insertion do not implicitly request a response. With server VAD,
 the provider normally commits audio and responds; with turn detection disabled,
 send `commit_audio` followed by `respond`.
 
@@ -131,10 +133,23 @@ Use a new output directory for each run. Results can contain prompts, transcript
 and tool data; keep them outside the repository. The runner reports missing
 measurements explicitly and measures virtual playback, not physical audio devices.
 
+The optional conformance probe checks an endpoint against the GA reference. Every
+server event it sees is checked for the reference's required fields, and each check
+drives one documented flow on a fresh session: lifecycle order, request metadata,
+cancellation, out-of-band responses, error correlation, item create/retrieve/delete,
+tool calls, manual audio commit/clear, and truncation of heard audio:
+
+```sh
+cargo run --locked --example conformance            # or name individual checks
+```
+
+It prints one JSON line per check (`pass`, `fail`, or `skip` with a reason) and exits
+non-zero on any failure. Passing covers these flows, not the whole reference.
+
 ## Compatibility and scope
 
 Melipona targets the GA OpenAI Realtime WebSocket event format. Provider features
-and turn policies vary; use the included scenarios to qualify an endpoint.
+and turn policies vary; use the conformance probe and scenarios to qualify an endpoint.
 A compatible text-completions API alone does not establish Realtime compatibility.
 
 Automated tests use local WebSocket/TLS peers and synthetic fixtures. They cover
