@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/melipona.png" width="360" alt="Papercraft bee speaking and listening on a flower-shaped candlestick telephone">
+  <img src="https://raw.githubusercontent.com/block/melipona/cc6eb4780eaa999126e256f05c69a953adfb4f7e/docs/assets/melipona.png" width="360" alt="Papercraft bee speaking and listening on a flower-shaped candlestick telephone">
 </p>
 
 <h1 align="center">Melipona</h1>
