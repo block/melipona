@@ -197,7 +197,8 @@ pub enum Command {
     /// returned to the host in `response.done`, never executed. After one, calls from a
     /// response that reports no `conversation_id` end the session instead. Only one
     /// request of either kind may await `response.created` at a time. After one names
-    /// an output format, a `response.created` that reports none ends the session.
+    /// an output format, audio from a response whose creation reported none ends the
+    /// session.
     Respond {
         #[serde(default)]
         response: Option<Value>,

@@ -60,13 +60,15 @@ its `event_id`, within `acknowledgement_timeout`; otherwise the session ends.
 `response.created` does not name the request it answers, and with server VAD
 the server creates responses of its own. So only one request, in-band or
 out-of-band, may await acknowledgement at a time; another is rejected until the
-first is created or fails, and any `response.created` settles it. Created
-out-of-band responses still run in parallel.
+first is created or fails. A `response.created` settles it unless its reported
+ownership rules the request out: a null `conversation_id` cannot answer an
+in-band request, nor a non-null one an out-of-band request. Created out-of-band
+responses still run in parallel.
 A response's output format is fixed at `response.created`: the one it reports,
 else the session's at that moment. Because no creation is known to answer a given
-request, once any request has named an output format, every later
-`response.created` must report its format; one that does not ends the session
-rather than mismeasure playback.
+request, once any request has named an output format, a response whose creation
+reported none has an unknown format: its first audio ends the session rather
+than mismeasure playback. Text-only responses are unaffected.
 
 Controls have independent bounded admission and an urgent socket lane. They can
 overtake queued media, but not a frame already being written. Audio/commit retain

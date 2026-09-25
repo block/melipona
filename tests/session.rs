@@ -1546,20 +1546,53 @@ async fn reported_output_format_governs_and_an_unreported_override_fails_closed(
         drain_until(&mut session, "response.done").await;
     }
     // No creation names its request: here the server's own (VAD) reports PCM and
-    // settles the pending G.711 request, so the next creation must report too.
+    // settles the pending G.711 request, so later audio needs a reported format too.
     session.handle.send(respond(out_of_band)).unwrap();
     recv(&mut peer).await;
     send(&mut peer,json!({"type":"response.created","response":{"id":"v","audio":{"output":{"format":{"type":"audio/pcm"}}}}})).await;
     drain_until(&mut session, "response.created").await;
-    send(
-        &mut peer,
-        json!({"type":"response.created","response":{"id":"o2","conversation_id":null}}),
-    )
-    .await;
+    // Text has nothing to measure, so an unreported creation is fine until audio.
+    for rid in ["text", "o2"] {
+        send(
+            &mut peer,
+            json!({"type":"response.created","response":{"id":rid,"conversation_id":null}}),
+        )
+        .await;
+        drain_until(&mut session, "response.created").await;
+    }
+    send(&mut peer, json!({"type":"response.output_audio.delta","response_id":"o2","item_id":"a_o2","content_index":0,"delta":second})).await;
     assert!(matches!(
         failed(&mut session).await,
-        Error::Protocol(e) if e.contains("omits its output format")
+        Error::Protocol(e) if e.contains("unreported format")
     ));
+}
+
+#[tokio::test]
+async fn reported_ownership_never_settles_the_other_kind_of_request() {
+    // An in-conversation creation (such as VAD's) cannot answer an out-of-band
+    // request, nor an out-of-band creation an in-band one.
+    for (request, conversation) in [
+        (json!({"conversation":"none"}), json!("conv")),
+        (json!({}), Value::Null),
+    ] {
+        let (mut session, mut peer) = open(ToolRegistry::empty(), |c| {
+            c.limits.acknowledgement_timeout = Duration::from_millis(100)
+        })
+        .await;
+        ready(&mut session, &mut peer).await;
+        session
+            .handle
+            .send(Command::Respond {
+                response: Some(request),
+            })
+            .unwrap();
+        recv(&mut peer).await;
+        send(&mut peer,json!({"type":"response.created","response":{"id":"other","conversation_id":conversation}})).await;
+        assert_eq!(
+            failed(&mut session).await,
+            Error::Timeout("response creation")
+        );
+    }
 }
 
 #[tokio::test]

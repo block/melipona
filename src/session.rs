@@ -197,13 +197,14 @@ struct Response {
     cancelled: bool,
     calls: HashSet<String>,
     continued: bool,
-    /// Output format fixed at creation; the session default applies before it.
+    /// Output format fixed at creation; `None` after a format request means unknown.
     format: Option<AudioFormat>,
 }
 /// A `response.create` awaiting its `response.created`.
 struct Pending {
     event_id: String,
     deadline: Instant,
+    out_of_band: bool,
 }
 struct Call {
     response: String,
@@ -258,8 +259,9 @@ struct Coordinator {
     /// Once out-of-band responses exist, only calls from a response that reports its
     /// conversation may execute.
     out_of_band_requested: bool,
-    /// Once a response has requested its own output format, a creation must report
-    /// its format: none names its request, so none may be assumed to use the default.
+    /// Once a response has requested its own output format, audio must come from a
+    /// creation that reported its format: none names its request, so none may be
+    /// assumed to use the default.
     format_requested: bool,
 }
 
@@ -505,6 +507,7 @@ impl Coordinator {
         self.create_id = Some(Pending {
             event_id,
             deadline: Instant::now() + self.config.limits.acknowledgement_timeout,
+            out_of_band,
         });
         Ok(())
     }
@@ -803,20 +806,22 @@ impl Coordinator {
                     .map(audio_format)
                     .transpose()?;
                 if !self.response(rid)?.created {
-                    // Any creation settles the pending request; it may be the server's
-                    // own (VAD), so it never inherits that request's format.
-                    self.create_id = None;
-                    if reported.is_none() && self.format_requested {
-                        return Err(Error::Protocol(
-                            "response.created omits its output format after a format request"
-                                .into(),
-                        ));
+                    // No creation names its request. Reported ownership rules one out;
+                    // without it, the creation settles whichever request is pending.
+                    if self
+                        .create_id
+                        .as_ref()
+                        .is_some_and(|p| conversation.is_none_or(|c| c != p.out_of_band))
+                    {
+                        self.create_id = None;
                     }
-                    let format = reported.unwrap_or(self.config.capabilities.output_audio);
+                    // It may be the server's own (VAD), so it never inherits a format.
+                    let session = self.config.capabilities.output_audio;
+                    let format = reported.or((!self.format_requested).then_some(session));
                     let state = self.response(rid)?;
                     state.created = true;
                     state.conversation = state.conversation.or(conversation);
-                    state.format = Some(format);
+                    state.format = format;
                     if conversation != Some(false) && !state.done {
                         self.active.insert(rid.to_owned());
                     }
@@ -825,10 +830,17 @@ impl Coordinator {
             }
             "response.output_audio.delta" => {
                 let rid = field(&event, "response_id")?;
-                let format = self
-                    .response(rid)?
-                    .format
-                    .unwrap_or(self.config.capabilities.output_audio);
+                let known = self.response(rid)?.format;
+                let format = match known {
+                    Some(format) => format,
+                    // After a format request, only a reported format can measure audio.
+                    None if self.format_requested => {
+                        return Err(Error::Protocol(
+                            "output audio of unreported format after a format request".into(),
+                        ));
+                    }
+                    None => self.config.capabilities.output_audio,
+                };
                 let item = field(&event, "item_id")?;
                 let index = event["content_index"]
                     .as_u64()
