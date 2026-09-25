@@ -25,3 +25,7 @@ jobs:
       - run: cargo +stable test --locked --all-targets
       - run: cargo +stable test --locked --all-targets --features serde_json/preserve_order,rustls/custom-provider
       - run: cargo +stable test --locked --doc
+      - run: cargo +stable clippy --locked --all-targets --features mcp -- -D warnings
+      - run: cargo +stable test --locked --all-targets --features mcp
+      - run: cargo +stable test --locked --all-targets --features mcp,serde_json/preserve_order,rustls/custom-provider
+      - run: cargo +stable test --locked --doc --features mcp
