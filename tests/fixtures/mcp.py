@@ -69,8 +69,10 @@ for line in sys.stdin:
         if mode == "protocol_error":
             send({"jsonrpc": "2.0", "id": ident, "error": {"code": -32603, "message": "fixture error"}})
             continue
-        if mode == "delayed":
-            time.sleep(0.15)
+        if mode == "held":
+            release = os.path.splitext(marker)[0] + ".release"
+            while not os.path.exists(release):
+                time.sleep(0.005)
         result = {"content": [{"type": "text", "text": mode}],
                   "structuredContent": {"name": message["params"]["name"],
                   "arguments": message["params"].get("arguments"),
