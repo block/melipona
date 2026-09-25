@@ -106,4 +106,8 @@ These are provider extensions. Incoming clear/pause/resume events remain raw
 server events: the host owns player actions and maps a clear to
 `playback_stopped`. Full Frankie extension parity is not claimed. Session options
 are explicit; builds that reject results during active responses must enable
-their background-result capability or reject that workflow.
+a verified background-result capability or reject that workflow. The tested
+Frankie endpoint rejected results during an active response even with its
+background-task option enabled; do not assume that option alone establishes
+support. Melipona currently sends the result and fails on rejection or its
+acknowledgement deadline, rather than queueing it until speech finishes.

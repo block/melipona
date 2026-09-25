@@ -1638,3 +1638,88 @@ async fn unacknowledged_out_of_band_requests_time_out() {
         Error::Timeout("response creation")
     );
 }
+
+#[cfg(all(feature = "mcp", unix))]
+#[tokio::test]
+async fn real_mcp_subprocess_dedup_ack_continuation_and_interruption() {
+    use melipona::mcp::{Mcp, McpConfig, McpLimits};
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    for interrupt in [false, true] {
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("melipona-session-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir(&fixture.0).unwrap();
+        let marker = fixture.0.join("calls");
+        let release = marker.with_extension("release");
+        let config: McpConfig = serde_json::from_value(json!({"mcpServers":{"dev":{
+            "command":"python3", "args":["-u","-c",include_str!("fixtures/mcp.py"),"held",marker]
+        }}}))
+        .unwrap();
+        let mcp = Mcp::connect(config, McpLimits::default(), 4096)
+            .await
+            .unwrap();
+        let (session, mut peer) = start(mcp.registry().unwrap()).await;
+        created(&mut peer, "r1").await;
+        let tool = item("mcp1", r#"{"value":42}"#, "dev__echo");
+        commit(&mut peer, "r1", tool.clone()).await;
+        // A socket write is not an admission barrier. Wait for the actual MCP
+        // call before local commands can race response creation/tool admission.
+        timeout(Duration::from_secs(5), async {
+            while !std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .contains("called")
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("MCP call was not admitted");
+        // The fixture cannot finish until we release it after these assertions.
+        session
+            .handle
+            .send(Command::Audio {
+                audio: STANDARD.encode([0u8; 48]),
+            })
+            .unwrap();
+        assert_eq!(recv(&mut peer).await["type"], "input_audio_buffer.append");
+        if interrupt {
+            session
+                .handle
+                .send(Command::Interrupt {
+                    response_id: "r1".into(),
+                    heard: vec![],
+                })
+                .unwrap();
+            assert_eq!(recv(&mut peer).await["type"], "response.cancel");
+        }
+        done(
+            &mut peer,
+            "r1",
+            if interrupt { "cancelled" } else { "completed" },
+            vec![tool.clone()],
+        )
+        .await;
+        std::fs::write(&release, "release").unwrap();
+        let result = recv(&mut peer).await;
+        assert_eq!(result["type"], "conversation.item.create");
+        assert_eq!(result["item"]["call_id"], "mcp1");
+        let output: Value =
+            serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output["structuredContent"]["arguments"]["value"], 42);
+        // Provider acknowledgement, not MCP completion, gates continuation.
+        quiet(&mut peer).await;
+        acknowledge(&mut peer, &result).await;
+        if !interrupt {
+            assert_eq!(recv(&mut peer).await["type"], "response.create");
+        }
+        quiet(&mut peer).await;
+        session.finish().await.unwrap();
+        mcp.shutdown().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "called\n");
+    }
+}
