@@ -200,11 +200,10 @@ struct Response {
     /// Output format fixed at creation; the session default applies before it.
     format: Option<AudioFormat>,
 }
-/// A `response.create` awaiting its `response.created`, with any format it requested.
+/// A `response.create` awaiting its `response.created`.
 struct Pending {
     event_id: String,
     deadline: Instant,
-    format: Option<AudioFormat>,
 }
 struct Call {
     response: String,
@@ -259,6 +258,9 @@ struct Coordinator {
     /// Once out-of-band responses exist, only calls from a response that reports its
     /// conversation may execute.
     out_of_band_requested: bool,
+    /// Once a response has requested its own output format, a creation must report
+    /// its format: none names its request, so none may be assumed to use the default.
+    format_requested: bool,
 }
 
 type Socket =
@@ -309,6 +311,7 @@ async fn run(
         ping_sent: false,
         oversized_key: RandomState::new(),
         out_of_band_requested: false,
+        format_requested: false,
     };
     let mut writer_joined = false;
     let mut result = async {
@@ -481,11 +484,11 @@ impl Coordinator {
             }
             event["response"] = parameters;
         }
-        let format = event
-            .pointer("/response/audio/output/format")
-            .map(audio_format)
-            .transpose()
-            .map_err(|e| Error::Config(e.to_string()))?;
+        let format = event.pointer("/response/audio/output/format");
+        if let Some(format) = format {
+            audio_format(format).map_err(|e| Error::Config(e.to_string()))?;
+        }
+        let format_requested = format.is_some();
         if self.create_id.is_some() {
             return Err(Error::Protocol(
                 "response request awaiting acknowledgement".into(),
@@ -498,10 +501,10 @@ impl Coordinator {
         let event_id = event["event_id"].as_str().expect("set above").to_owned();
         self.send(event)?;
         self.out_of_band_requested |= out_of_band;
+        self.format_requested |= format_requested;
         self.create_id = Some(Pending {
             event_id,
             deadline: Instant::now() + self.config.limits.acknowledgement_timeout,
-            format,
         });
         Ok(())
     }
@@ -800,16 +803,16 @@ impl Coordinator {
                     .map(audio_format)
                     .transpose()?;
                 if !self.response(rid)?.created {
-                    // The creation may answer the pending request or be the server's
+                    // Any creation settles the pending request; it may be the server's
                     // own (VAD), so it never inherits that request's format.
-                    let session = self.config.capabilities.output_audio;
-                    let requested = self.create_id.take().and_then(|p| p.format);
-                    if reported.is_none() && requested.is_some_and(|f| f != session) {
+                    self.create_id = None;
+                    if reported.is_none() && self.format_requested {
                         return Err(Error::Protocol(
-                            "response.created omits a requested output format".into(),
+                            "response.created omits its output format after a format request"
+                                .into(),
                         ));
                     }
-                    let format = reported.unwrap_or(session);
+                    let format = reported.unwrap_or(self.config.capabilities.output_audio);
                     let state = self.response(rid)?;
                     state.created = true;
                     state.conversation = state.conversation.or(conversation);

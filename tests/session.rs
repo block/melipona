@@ -1545,24 +1545,20 @@ async fn reported_output_format_governs_and_an_unreported_override_fails_closed(
         done(&mut peer, rid, "cancelled", vec![]).await;
         drain_until(&mut session, "response.done").await;
     }
-    // Explicitly asking for the session's format needs no report.
-    session
-        .handle
-        .send(respond(
-            json!({"audio":{"output":{"format":{"type":"audio/pcm"}}}}),
-        ))
-        .unwrap();
-    recv(&mut peer).await;
-    created(&mut peer, "q").await;
-    drain_until(&mut session, "response.created").await;
-    // An unattributed creation (here the server's own, with VAD) may not be the
-    // G.711 request, so without a reported format it cannot be measured.
+    // No creation names its request: here the server's own (VAD) reports PCM and
+    // settles the pending G.711 request, so the next creation must report too.
     session.handle.send(respond(out_of_band)).unwrap();
     recv(&mut peer).await;
-    created(&mut peer, "v").await;
+    send(&mut peer,json!({"type":"response.created","response":{"id":"v","audio":{"output":{"format":{"type":"audio/pcm"}}}}})).await;
+    drain_until(&mut session, "response.created").await;
+    send(
+        &mut peer,
+        json!({"type":"response.created","response":{"id":"o2","conversation_id":null}}),
+    )
+    .await;
     assert!(matches!(
         failed(&mut session).await,
-        Error::Protocol(e) if e.contains("omits a requested output format")
+        Error::Protocol(e) if e.contains("omits its output format")
     ));
 }
 

@@ -63,9 +63,10 @@ out-of-band, may await acknowledgement at a time; another is rejected until the
 first is created or fails, and any `response.created` settles it. Created
 out-of-band responses still run in parallel.
 A response's output format is fixed at `response.created`: the one it reports,
-else the session's at that moment. A creation is never assumed to answer the
-pending request, so if that request asked for a different format and the
-creation reports none, the session ends rather than mismeasure playback.
+else the session's at that moment. Because no creation is known to answer a given
+request, once any request has named an output format, every later
+`response.created` must report its format; one that does not ends the session
+rather than mismeasure playback.
 
 Controls have independent bounded admission and an urgent socket lane. They can
 overtake queued media, but not a frame already being written. Audio/commit retain
