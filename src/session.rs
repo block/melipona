@@ -813,10 +813,11 @@ impl Coordinator {
                     .map(audio_format)
                     .transpose()?;
                 if !self.response(rid)?.created {
-                    let pending = if conversation == Some(false) {
-                        self.out_of_band.take()
-                    } else {
-                        self.create_id.take()
+                    // Without conversation_id, a pending in-band request answers first.
+                    let pending = match conversation {
+                        Some(false) => self.out_of_band.take(),
+                        Some(true) => self.create_id.take(),
+                        None => self.create_id.take().or_else(|| self.out_of_band.take()),
                     };
                     let format = reported
                         .or(pending.map(|p| p.format))

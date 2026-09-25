@@ -1542,6 +1542,12 @@ async fn unacknowledged_out_of_band_requests_time_out() {
     session.handle.send(respond()).unwrap();
     recv(&mut peer).await;
     send(&mut peer, json!({"type":"response.created","response":{"id":"o","status":"in_progress","conversation_id":null}})).await;
+    drain_until(&mut session, "response.created").await;
+    // A provider may omit conversation_id; with no in-band request pending, the
+    // creation can only answer the out-of-band one.
+    session.handle.send(respond()).unwrap();
+    recv(&mut peer).await;
+    created(&mut peer, "u").await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(*session.status.borrow(), Status::Ready);
     // A request the server never acknowledges ends the session at its deadline.

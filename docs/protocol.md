@@ -59,7 +59,9 @@ Every request must be acknowledged by `response.created`, or by an `error` namin
 its `event_id`, within `acknowledgement_timeout`; otherwise the session ends.
 Out-of-band responses run in parallel, but `response.created` does not name the
 request it answers, so only one out-of-band request may await acknowledgement at
-a time; another is rejected until the first is created or fails.
+a time; another is rejected until the first is created or fails. A
+`response.created` without `conversation_id` settles a pending in-band request
+first, else the out-of-band one.
 A response's output format is fixed at `response.created`: the one it reports,
 else the one its request asked for, else the session's at that moment.
 
