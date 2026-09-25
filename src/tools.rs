@@ -52,7 +52,10 @@ impl ToolRegistry {
                 || tool.description.len() > 16 * 1024
                 || tool.name.len() > 64
             {
-                return Err(Error::Config("tool definition exceeds size limit".into()));
+                return Err(Error::Config(format!(
+                    "tool definition exceeds size limit: {}",
+                    tool.name
+                )));
             }
             if tool.name.is_empty() || validators.contains_key(&tool.name) {
                 return Err(Error::Config("empty or duplicate tool name".into()));

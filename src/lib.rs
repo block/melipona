@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+#[cfg(feature = "mcp")]
+pub mod mcp;
 mod session;
 mod tools;
 

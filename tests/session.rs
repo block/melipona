@@ -1638,3 +1638,62 @@ async fn unacknowledged_out_of_band_requests_time_out() {
         Error::Timeout("response creation")
     );
 }
+
+#[cfg(all(feature = "mcp", unix))]
+#[tokio::test]
+async fn real_mcp_subprocess_dedup_ack_continuation_and_interruption() {
+    use melipona::mcp::{Mcp, McpConfig, McpLimits};
+    for interrupt in [false, true] {
+        let config: McpConfig = serde_json::from_value(json!({"mcpServers":{"dev":{
+            "command":"python3", "args":["-u","-c",include_str!("fixtures/mcp.py"),"delayed"]
+        }}}))
+        .unwrap();
+        let mcp = Mcp::connect(config, McpLimits::default(), 4096)
+            .await
+            .unwrap();
+        let (session, mut peer) = start(mcp.registry().unwrap()).await;
+        created(&mut peer, "r1").await;
+        let tool = item("mcp1", r#"{"value":42}"#, "dev__echo");
+        commit(&mut peer, "r1", tool.clone()).await;
+        // Audio input still goes out while the subprocess's tool is sleeping.
+        session
+            .handle
+            .send(Command::Audio {
+                audio: STANDARD.encode([0u8; 48]),
+            })
+            .unwrap();
+        assert_eq!(recv(&mut peer).await["type"], "input_audio_buffer.append");
+        if interrupt {
+            session
+                .handle
+                .send(Command::Interrupt {
+                    response_id: "r1".into(),
+                    heard: vec![],
+                })
+                .unwrap();
+            assert_eq!(recv(&mut peer).await["type"], "response.cancel");
+        }
+        done(
+            &mut peer,
+            "r1",
+            if interrupt { "cancelled" } else { "completed" },
+            vec![tool.clone()],
+        )
+        .await;
+        let result = recv(&mut peer).await;
+        assert_eq!(result["type"], "conversation.item.create");
+        assert_eq!(result["item"]["call_id"], "mcp1");
+        let output: Value =
+            serde_json::from_str(result["item"]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output["structuredContent"]["arguments"]["value"], 42);
+        // Provider acknowledgement, not MCP completion, gates continuation.
+        quiet(&mut peer).await;
+        acknowledge(&mut peer, &result).await;
+        if !interrupt {
+            assert_eq!(recv(&mut peer).await["type"], "response.create");
+        }
+        quiet(&mut peer).await;
+        session.finish().await.unwrap();
+        mcp.shutdown().await.unwrap();
+    }
+}
