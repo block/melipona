@@ -1,0 +1,7 @@
+{"type":"response.created","response":{"id":"media","status":"in_progress"}}
+{"type":"response.output_text.delta","response_id":"media","item_id":"text","output_index":0,"content_index":0,"delta":"Hello."}
+{"type":"response.output_audio.delta","response_id":"media","item_id":"audio","output_index":0,"content_index":0,"delta":"AAAAAA=="}
+{"type":"response.output_audio_transcript.delta","response_id":"media","item_id":"audio","output_index":0,"content_index":0,"delta":"Hello."}
+{"type":"input_audio_buffer.speech_started","audio_start_ms":100,"item_id":"user"}
+{"type":"future.public.event","payload":{"unknown":"preserved"}}
+{"type":"response.done","response":{"id":"media","status":"completed","output":[]}}

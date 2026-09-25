@@ -1,0 +1,30 @@
+[package]
+name = "melipona"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A minimal realtime voice agent harness"
+repository = "https://github.com/block/melipona"
+readme = "README.md"
+include = ["src/**", "examples/**", "tests/**", "scenarios/*.json", "scenarios/README.md", "Cargo.toml", "Cargo.lock", "README.md", "docs/**", "CONTRIBUTING.md", "LICENSE"]
+
+[dependencies]
+base64 = "0.23"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+jsonschema = { version = "0.57", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+
+# Explicit provider: WSS must never depend on another crate installing one.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
