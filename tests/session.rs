@@ -1007,12 +1007,36 @@ async fn negotiated_audio_format_and_per_part_history_are_respected() {
 }
 
 #[tokio::test]
-async fn same_audio_part_cannot_change_format_midstream() {
+async fn a_responses_format_is_fixed_at_creation() {
     let (mut session, mut peer) = start(ToolRegistry::empty()).await;
+    let pcmu = json!({"type":"session.updated","session":{"audio":{"output":{"format":{"type":"audio/pcmu"}}}}});
+    let delta = |rid: &str, item: &str| json!({"type":"response.output_audio.delta","response_id":rid,"item_id":item,"content_index":0,"delta":STANDARD.encode([0u8; 4800])});
+    let interrupt = |ms| Command::Interrupt {
+        response_id: "r".into(),
+        heard: vec![Heard {
+            item_id: "a".into(),
+            content_index: 0,
+            audio_end_ms: ms,
+        }],
+    };
+    // Created under 24 kHz PCM: a later default, before or during its audio, is not its.
     created(&mut peer, "r").await;
-    send(&mut peer,json!({"type":"response.output_audio.delta","response_id":"r","item_id":"a","content_index":0,"delta":"AAAA"})).await;
-    send(&mut peer,json!({"type":"session.updated","session":{"audio":{"output":{"format":{"type":"audio/pcmu"}}}}})).await;
-    send(&mut peer,json!({"type":"response.output_audio.delta","response_id":"r","item_id":"a","content_index":0,"delta":"AAAA"})).await;
+    send(&mut peer, pcmu.clone()).await;
+    send(&mut peer, delta("r", "a")).await;
+    send(&mut peer, pcmu).await;
+    send(&mut peer, delta("r", "a")).await;
+    drain_until(&mut session, "response.output_audio.delta").await;
+    drain_until(&mut session, "response.output_audio.delta").await;
+    // 9600 bytes are 200 ms of PCM16, not 1200 ms of G.711.
+    session.handle.send(interrupt(500)).unwrap();
+    assert!(rejected(&mut session).await.contains("heard position"));
+    session.handle.send(interrupt(200)).unwrap();
+    assert_eq!(recv(&mut peer).await["type"], "response.cancel");
+    assert_eq!(recv(&mut peer).await["audio_end_ms"], 200);
+    // Audio before creation takes the current default; creation cannot change it.
+    send(&mut peer, delta("s", "b")).await;
+    send(&mut peer,json!({"type":"response.created","response":{"id":"s","audio":{"output":{"format":{"type":"audio/pcm"}}}}})).await;
+    send(&mut peer, delta("s", "b")).await;
     assert!(
         matches!(failed(&mut session).await,Error::Protocol(s) if s.contains("format conflict"))
     );
@@ -1490,23 +1514,6 @@ async fn requested_output_format_governs_that_responses_playback_positions() {
         done(&mut peer, rid, "cancelled", vec![]).await;
         drain_until(&mut session, "response.done").await;
     }
-    // Only one format can be inferred for requests awaiting creation.
-    session
-        .handle
-        .send(respond(json!({"conversation":"none"})))
-        .unwrap();
-    recv(&mut peer).await;
-    session
-        .handle
-        .send(respond(
-            json!({"conversation":"none","audio":{"output":{"format":{"type":"audio/pcma"}}}}),
-        ))
-        .unwrap();
-    assert!(
-        rejected(&mut session)
-            .await
-            .contains("share an output format")
-    );
     session.finish().await.unwrap();
 }
 
@@ -1520,13 +1527,21 @@ async fn unacknowledged_out_of_band_requests_time_out() {
     let respond = || Command::Respond {
         response: Some(json!({"conversation":"none"})),
     };
-    // Created and rejected requests are settled.
+    // A created response names no request, so one awaits acknowledgement at a time.
+    session.handle.send(respond()).unwrap();
+    let first = recv(&mut peer).await;
+    session.handle.send(respond()).unwrap();
+    assert!(
+        rejected(&mut session)
+            .await
+            .contains("awaiting acknowledgement")
+    );
+    // Rejected and created requests are settled.
+    send(&mut peer, json!({"type":"error","error":{"type":"invalid_request_error","message":"no","event_id":first["event_id"]}})).await;
+    drain_until(&mut session, "error").await;
     session.handle.send(respond()).unwrap();
     recv(&mut peer).await;
     send(&mut peer, json!({"type":"response.created","response":{"id":"o","status":"in_progress","conversation_id":null}})).await;
-    session.handle.send(respond()).unwrap();
-    let rejected = recv(&mut peer).await;
-    send(&mut peer, json!({"type":"error","error":{"type":"invalid_request_error","message":"no","event_id":rejected["event_id"]}})).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(*session.status.borrow(), Status::Ready);
     // A request the server never acknowledges ends the session at its deadline.
