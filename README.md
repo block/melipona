@@ -111,7 +111,9 @@ cargo run --locked --features mcp
 Install the configured server separately. This example uses
 [buzz-dev-mcp](https://github.com/block/buzz/tree/main/crates/buzz-dev-mcp),
 not a linked Buzz dependency. `command` is an executable, not a shell expression;
-`args`, `env`, and `cwd` are optional. Server keys use `[a-z0-9-]{1,16}`. The optional
+`args`, `env`, `cwd`, and `type:"stdio"` are optional. Other transports are rejected.
+Unrelated top-level configuration keys are ignored; unknown server fields are
+rejected. Server keys use `[a-z0-9-]{1,16}`. The optional
 `tools` list uses **original MCP names**; omit it to expose every listed tool, or
 use `[]` to expose none. Unknown selected tools and unsupported selected schemas
 fail startup, rather than silently losing validation. `--echo-tool` cannot be
@@ -130,21 +132,26 @@ where possible, otherwise with a stable sanitized/hash alias; calls route by an
 explicit map to the original name. Schemas remain unchanged. Text,
 `structuredContent`, and `isError` survive result mapping; binary blocks are
 represented by omission descriptors, not delivered to the model as images/audio.
-Oversized results become explicitly truncated JSON previews with error status
-retained. There is no transparent replay or restart after an uncertain failure.
+Oversized results become explicitly truncated head/tail previews with error status
+retained: readable text when available, otherwise labelled JSON. Structured data
+is not preserved as structured data after truncation. There is no transparent
+replay or restart after an uncertain failure.
 
 The adapter uses rmcp for negotiation, framing, request IDs and cancellation.
 It supports ordinary local stdio tool calls, not remote MCP, dynamic catalog
 updates, sampling, roots, elicitation or task-required tools. A standards-compliant
 server requiring one of those capabilities is outside this version's scope.
 Transport frames, discovery pages/count/bytes and startup are bounded; the
-existing session bounds concurrency, arguments, output and tool deadlines.
+existing session bounds concurrency, arguments, output and tool deadlines. Servers
+start sequentially; the default startup limit is 15 seconds per server, up to
+16 servers (240 seconds total).
 
 Library hosts use `mcp::Mcp::connect`, `registry()` (or `tools()` plus a wrapped
 `executor()`), and `catalog()` for original metadata including annotations.
 Annotations are hints, not authorization. Applications can wrap the executor to
 implement their own approval policy; Melipona contains no approval UI.
-Finish all sessions before awaiting `mcp.shutdown()`:
+Prefer finishing sessions before awaiting `mcp.shutdown()`; shutting down the
+adapter first also cancels still-live calls safely:
 
 ```rust,no_run
 # #[cfg(feature = "mcp")]
@@ -171,6 +178,13 @@ server's responsibility. Dropping the owner without shutdown uses immediate
 termination; a forced host kill cannot run cleanup. Windows uses a Job Object,
 but Windows process cleanup has not been live-qualified by the Unix tests.
 Do not equate an uncertain transport failure with a tool that never ran.
+
+**Known provider limitation:** live Frankie tests rejected tool results inserted
+while another response was active, both with MCP and with the built-in echo tool.
+The tested background-task option did not resolve this. Ordinary tool-result
+acknowledgement followed by spoken continuation passed; overlapping result
+insertion remains unqualified ([tracked separately](https://github.com/block/melipona/issues/3)).
+No retry or coordinator workaround is added here.
 
 ## Session behavior
 

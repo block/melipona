@@ -3,6 +3,8 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) const MAX_TOOLS: usize = 128;
+
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 #[derive(Clone, Debug)]
@@ -42,8 +44,10 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(tools: Vec<Tool>, executor: Arc<dyn ToolExecutor>) -> Result<Self, Error> {
-        if tools.len() > 128 {
-            return Err(Error::Config("too many tool schemas (maximum 128)".into()));
+        if tools.len() > MAX_TOOLS {
+            return Err(Error::Config(format!(
+                "too many tool schemas (maximum {MAX_TOOLS})"
+            )));
         }
         let mut validators = HashMap::new();
         let mut definitions = Vec::new();

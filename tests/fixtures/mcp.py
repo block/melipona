@@ -38,7 +38,9 @@ for line in sys.stdin:
             original = "x" * 70
             alias = ("dev__" + original)[:47] + "_" + hashlib.sha256(("dev\0" + original).encode()).hexdigest()[:16]
             names = [original, alias[len("dev__"):]]
-        result = {"tools": [{"name": name, "inputSchema": schema,
+        if mode == "schema_prefix":
+            names = ["a", "ab"]
+        result = {"tools": [{"name": name, "inputSchema": ({"$ref": "https://example.invalid/schema"} if mode == "schema_prefix" and name == "ab" else schema),
                   "annotations": {"destructiveHint": True}} for name in names]}
         if mode == "cycle":
             result["nextCursor"] = "same"
@@ -55,10 +57,14 @@ for line in sys.stdin:
             continue
         if mode == "pending":
             continue
-        if mode == "descendant":
+        if mode in ("descendant", "exit_on_eof", "exit_on_call"):
             child = subprocess.Popen(["sleep", "60"])
             with open(marker, "a") as output:
                 output.write(str(child.pid) + "\n")
+                if mode != "descendant":
+                    output.write("leader=" + str(os.getpid()) + "\n")
+            if mode == "exit_on_call":
+                break
             continue
         if mode == "protocol_error":
             send({"jsonrpc": "2.0", "id": ident, "error": {"code": -32603, "message": "fixture error"}})

@@ -154,7 +154,11 @@ async fn invalid_selected_schema_missing_filter_cursor_cycle_and_startup_timeout
         let result = Mcp::connect(
             config(json!({"dev":server(mode,None)})),
             McpLimits {
-                startup_timeout: Duration::from_millis(200),
+                startup_timeout: if mode == "hang_init" {
+                    Duration::from_millis(200)
+                } else {
+                    Duration::from_secs(3)
+                },
                 ..limits()
             },
             4096,
@@ -395,7 +399,7 @@ async fn shutdown_and_drop_kill_uncooperative_same_group_descendants() {
 }
 
 #[test]
-fn cli_rejects_configuration_without_echo_or_feature_ambiguity() {
+fn cli_rejects_echo_with_mcp() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_melipona"))
         .env("REALTIME_URL", "ws://127.0.0.1:1")
         .env("REALTIME_MCP", r#"{"mcpServers":{}}"#)
@@ -487,4 +491,121 @@ async fn shutdown_cancels_live_calls_and_rejects_later_calls() {
             .unwrap()["outcome"],
         "not_dispatched"
     );
+}
+
+// rmcp 1.8 has a 1024-slot peer queue. On this current-thread runtime no
+// transport task runs between these polls, so the final send must await capacity.
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_while_sdk_admission_is_saturated_is_not_dispatched() {
+    let mcp = Mcp::connect(
+        config(json!({"dev":server("pending",None)})),
+        McpLimits::default(),
+        4096,
+    )
+    .await
+    .unwrap();
+    let executor = mcp.executor();
+    let mut fillers = Vec::new();
+    for _ in 0..1024 {
+        let mut future = Box::pin(tokio::task::unconstrained(
+            executor.execute(call("dev__echo"), ToolCancellation::new()),
+        ));
+        assert!(futures_util::poll!(&mut future).is_pending());
+        fillers.push(future);
+    }
+    let cancel = ToolCancellation::new();
+    let mut blocked = Box::pin(tokio::task::unconstrained(
+        executor.execute(call("dev__echo"), cancel.clone()),
+    ));
+    assert!(futures_util::poll!(&mut blocked).is_pending());
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), blocked)
+        .await
+        .expect("cancellation must not wait for queue capacity or a tool response")
+        .unwrap();
+    assert_eq!(result["outcome"], "not_dispatched");
+    drop(fillers);
+    mcp.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exited_leader_does_not_leave_its_process_group_alive() {
+    for explicit in [true, false] {
+        let marker = Marker::new();
+        let mode = if explicit {
+            "exit_on_eof"
+        } else {
+            "exit_on_call"
+        };
+        let mcp = Mcp::connect(
+            config(json!({"dev":server(mode,Some(&marker.0))})),
+            limits(),
+            4096,
+        )
+        .await
+        .unwrap();
+        let executor = mcp.executor();
+        let task = tokio::spawn(async move {
+            executor
+                .execute(call("dev__echo"), ToolCancellation::new())
+                .await
+        });
+        let text = marker.wait("leader=").await;
+        let child = text
+            .lines()
+            .find(|line| line.parse::<u32>().is_ok())
+            .unwrap();
+        let leader = text
+            .lines()
+            .find_map(|line| line.strip_prefix("leader="))
+            .unwrap();
+        if !explicit {
+            assert_process_gone(leader).await;
+        }
+        let result = if explicit {
+            mcp.shutdown().await
+        } else {
+            drop(mcp);
+            Ok(())
+        };
+        assert_process_gone(child).await;
+        result.unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
+async fn pasted_stdio_configs_and_exact_schema_error_identity() {
+    let mut dev = server("one", None);
+    dev["type"] = json!("stdio");
+    let pasted: McpConfig =
+        serde_json::from_value(json!({"mcpServers":{"dev":dev},"unrelated":true})).unwrap();
+    Mcp::connect(pasted, limits(), 4096)
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    dev["type"] = json!("synthetic-private-value");
+    let error = Mcp::connect(config(json!({"dev":dev})), limits(), 4096)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("type must be stdio"));
+    assert!(!error.contains("synthetic-private-value"));
+    dev["unexpected"] = json!(true);
+    assert!(serde_json::from_value::<McpConfig>(json!({"mcpServers":{"dev":dev}})).is_err());
+    let error = Mcp::connect(
+        config(json!({"dev":server("schema_prefix",None)})),
+        limits(),
+        4096,
+    )
+    .await
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("(MCP dev/ab)"), "{error}");
+    assert!(!error.contains("(MCP dev/a)"), "{error}");
 }

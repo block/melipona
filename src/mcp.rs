@@ -28,7 +28,6 @@ use tokio_util::{
 /// Trusted launch configuration, compatible with the local `mcpServers` envelope.
 /// No interpolation, remote transport, or shell interpretation is performed.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     #[serde(rename = "mcpServers")]
     pub servers: BTreeMap<String, McpServer>,
@@ -39,6 +38,9 @@ pub struct McpConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
+    /// Optional explicit transport. Only `stdio` is supported.
+    #[serde(rename = "type")]
+    pub transport: Option<String>,
     pub command: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
@@ -149,18 +151,8 @@ impl Mcp {
         {
             return Err(config_error("invalid MCP limits"));
         }
-        let mut owner = Self {
-            servers: Vec::new(),
-            catalog: Vec::new(),
-            executor: Arc::new(Executor {
-                routes: HashMap::new(),
-                cleanup: TaskTracker::new(),
-                cleanup_timeout: limits.shutdown_timeout,
-                shutdown: ToolCancellation::new(),
-                result_bytes,
-            }),
-            limits,
-        };
+        let mut servers = Vec::new();
+        let mut catalog = Vec::new();
         let mut routes = HashMap::new();
         for (name, config) in config.servers {
             if name.is_empty()
@@ -171,16 +163,24 @@ impl Mcp {
             {
                 return Err(config_error("MCP server names must match [a-z0-9-]{1,16}"));
             }
-            let result = tokio::time::timeout(
-                owner.limits.startup_timeout,
-                connect_server(&config, &owner.limits),
-            )
-            .await
-            .map_err(|_| config_error(format!("MCP server {name}: startup timed out")))?;
+            if config
+                .transport
+                .as_deref()
+                .is_some_and(|kind| kind != "stdio")
+            {
+                // Do not echo arbitrary config strings: even a misplaced value can be a secret.
+                return Err(config_error(format!(
+                    "MCP server {name}: unsupported transport; type must be stdio"
+                )));
+            }
+            let result =
+                tokio::time::timeout(limits.startup_timeout, connect_server(&config, &limits))
+                    .await
+                    .map_err(|_| config_error(format!("MCP server {name}: startup timed out")))?;
             let (server, tools) =
                 result.map_err(|reason| config_error(format!("MCP server {name}: {reason}")))?;
             let peer = server.service.peer().clone();
-            owner.servers.push(server);
+            servers.push(server);
             let mut selected: HashSet<String> = config
                 .tools
                 .clone()
@@ -220,28 +220,40 @@ impl Mcp {
                         name: definition.name.to_string(),
                     },
                 );
-                owner.catalog.push(McpTool {
+                catalog.push(McpTool {
                     server: name.clone(),
                     alias,
                     definition,
                 });
-                if owner.catalog.len() > 128 {
-                    return Err(config_error("too many exposed MCP tools (maximum 128)"));
+                if catalog.len() > crate::tools::MAX_TOOLS {
+                    return Err(config_error(format!(
+                        "too many exposed MCP tools (maximum {})",
+                        crate::tools::MAX_TOOLS
+                    )));
                 }
             }
             if !selected.is_empty() {
+                let mut missing: Vec<_> = selected.into_iter().collect();
+                missing.sort();
                 return Err(config_error(format!(
-                    "MCP server {name}: selected tool not found"
+                    "MCP server {name}: selected tools not found: {}",
+                    missing.join(", ")
                 )));
             }
         }
-        owner.executor = Arc::new(Executor {
+        let executor = Arc::new(Executor {
             routes,
             cleanup: TaskTracker::new(),
-            cleanup_timeout: owner.limits.shutdown_timeout,
+            cleanup_timeout: limits.shutdown_timeout,
             shutdown: ToolCancellation::new(),
             result_bytes,
         });
+        let owner = Self {
+            servers,
+            catalog,
+            executor,
+            limits,
+        };
         // Reuse the core validator; never loosen schemas to fit the adapter.
         owner.registry()?;
         Ok(owner)
@@ -265,9 +277,15 @@ impl Mcp {
     /// Build a registry using the same schema validation as native tools.
     pub fn registry(&self) -> Result<ToolRegistry, Error> {
         ToolRegistry::new(self.tools(), self.executor()).map_err(|e| {
-            let mut detail = e.to_string();
+            let mut detail = match e {
+                Error::Config(detail) => detail,
+                other => return other,
+            };
             for tool in &self.catalog {
-                if detail.contains(&tool.alias) {
+                if detail.strip_prefix("invalid schema for tool ") == Some(&tool.alias)
+                    || detail.strip_prefix("tool definition exceeds size limit: ")
+                        == Some(&tool.alias)
+                {
                     detail.push_str(&format!(" (MCP {}/{})", tool.server, tool.definition.name));
                     break;
                 }
@@ -531,19 +549,40 @@ fn bound_result(value: Value, limit: usize) -> Value {
     if encoded.len() <= limit {
         return value;
     }
-    // Worst-case JSON escaping needs six bytes per input byte. Preserve error
-    // status, label the preview explicitly, and never pretend truncated JSON is data.
-    let budget = limit.saturating_sub(192) / 12;
-    let mut head = budget.min(encoded.len());
-    while !encoded.is_char_boundary(head) {
-        head -= 1;
+    // Prefer readable tool text over a doubly encoded JSON fragment. For
+    // structured-only results retain a labelled JSON preview instead.
+    let text = value["content"]
+        .as_array()
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let (source, preview) = if text.is_empty() {
+        ("json", encoded.as_str())
+    } else {
+        ("text", text.as_str())
+    };
+    let mut budget = limit / 2;
+    loop {
+        let mut head = budget.min(preview.len());
+        while !preview.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = preview.len().saturating_sub(budget).max(head);
+        while !preview.is_char_boundary(tail) {
+            tail += 1;
+        }
+        let result = json!({"truncated":true,"isError":value["isError"].as_bool().unwrap_or(value.get("error").is_some()),
+            "originalBytes":encoded.len(),"previewSource":source,"head":&preview[..head],"tail":&preview[tail..]});
+        if result.to_string().len() <= limit {
+            return result;
+        }
+        budget /= 2;
     }
-    let mut tail = encoded.len().saturating_sub(budget);
-    while !encoded.is_char_boundary(tail) {
-        tail += 1;
-    }
-    json!({"truncated":true,"isError":value["isError"].as_bool().unwrap_or(value.get("error").is_some()),
-        "originalBytes":encoded.len(),"head":&encoded[..head],"tail":&encoded[tail..]})
 }
 
 #[cfg(test)]
@@ -570,6 +609,20 @@ mod tests {
             .collect();
         assert_eq!(forward, reverse);
         assert_eq!(forward.values().collect::<HashSet<_>>().len(), names.len());
+        let text = "readable line\nwith \"quotes\" and Unicode 界 ".repeat(4000);
+        let result = bound_result(
+            json!({"content":[{"type":"text","text":text}],"isError":true}),
+            65536,
+        );
+        assert_eq!(result["previewSource"], "text");
+        assert!(
+            result["head"]
+                .as_str()
+                .unwrap()
+                .contains("line\nwith \"quotes\"")
+        );
+        assert!(result.to_string().len() > 32768);
+        assert!(result.to_string().len() <= 65536);
         for size in [256, 257, 512, 1024] {
             let result = bound_result(
                 json!({"isError":true,"structuredContent":{"value":"界\\\"\n".repeat(2048)}}),
