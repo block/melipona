@@ -1,4 +1,4 @@
-# CLI reference
+# CLI and session reference
 
 | Environment variable | Purpose |
 | --- | --- |

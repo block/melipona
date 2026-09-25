@@ -85,7 +85,3 @@ The tested background-task option did not resolve this. Ordinary tool-result
 acknowledgement followed by spoken continuation passed; overlapping result
 insertion remains unqualified ([tracked separately](https://github.com/block/melipona/issues/3)).
 No retry or coordinator workaround is added here.
-
----
-
-[Overview](../README.md) · [Session contract](protocol.md)

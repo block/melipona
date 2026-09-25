@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/block/melipona/cc6eb4780eaa999126e256f05c69a953adfb4f7e/docs/assets/melipona.png" width="360" alt="Papercraft bee speaking and listening on a flower-shaped candlestick telephone">
+  <img src="docs/assets/melipona.png" width="360" alt="Papercraft bee speaking and listening on a flower-shaped candlestick telephone">
 </p>
 
 <h1 align="center">Melipona</h1>
 
 <p align="center">
-  <strong>A minimal realtime voice agent harness, in Rust.</strong><br>
-  Speak, listen, and call tools on one open line.
+  <strong>A minimal realtime voice agent harness.</strong><br>
+  Written in Rust. Built for the open line.
 </p>
 
 <p align="center">
@@ -31,11 +31,15 @@ permissions. The endpoint supplies the model, transcription, speech synthesis,
 and turn detection. Melipona includes no model weights, inference server, or audio UI.
 
 ```text
-Your application       Melipona                 Realtime endpoint
-mic + player     ←→    session + playback   ←→   model + voice
-                            ↕
-                       your tools
-                    ToolExecutor / MCP
+Your app
+mic + player
+     |
+Melipona ----- Your tools
+session       ToolExecutor / MCP
++ playback
+     |
+Realtime endpoint
+model + voice
 ```
 
 ## Quick start
@@ -125,6 +129,8 @@ stdio servers to the same tool registry and executor used by the Rust API.
 > Tools run with your user privileges. MCP is not a sandbox, and a working directory
 > does not restrict file access. Inherited credentials other than `REALTIME_*` are
 > not isolated. Only use trusted configuration and executables.
+> Tool descriptions and results are server-supplied data, not trusted instructions;
+> MCP does not protect against prompt injection.
 
 With a compatible endpoint configured and `buzz-dev-mcp` installed separately:
 
@@ -164,7 +170,7 @@ call deduplication is not durable exactly-once execution.
 | Read next | What you will find |
 | :--- | :--- |
 | [Session & playback](docs/protocol.md) | Interruption, heard-audio positions, continuation, limits. |
-| [CLI reference](docs/usage.md) | Environment variables and session behavior. |
+| [CLI & session reference](docs/usage.md) | Environment variables and session behavior. |
 | [Local MCP](docs/mcp.md) | Server configuration, permissions, result mapping, cleanup. |
 | [Testing & compatibility](docs/testing.md) | Full suites, conformance checks, provider caveats. |
 | [Scenario guide](scenarios/README.md) | Repeatable text, audio, image, and tool workflows. |
