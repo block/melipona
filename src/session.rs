@@ -3,7 +3,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     hash::{BuildHasher, RandomState},
     panic::AssertUnwindSafe,
 };
@@ -197,6 +197,14 @@ struct Response {
     cancelled: bool,
     calls: HashSet<String>,
     continued: bool,
+    /// Output format fixed at creation; the session default applies otherwise.
+    format: Option<AudioFormat>,
+}
+/// A `response.create` awaiting its `response.created`, with the format it requested.
+struct Pending {
+    event_id: String,
+    deadline: Instant,
+    format: AudioFormat,
 }
 struct Call {
     response: String,
@@ -242,7 +250,9 @@ struct Coordinator {
     frankie_feedback: bool,
     init_id: String,
     init_deadline: Instant,
-    create_id: Option<(String, Instant)>,
+    create_id: Option<Pending>,
+    /// Out-of-band requests in send order; they share one requested output format.
+    out_of_band: VecDeque<Pending>,
     received: Instant,
     ping_sent: bool,
     oversized_key: RandomState,
@@ -295,6 +305,7 @@ async fn run(
         frankie_feedback: false,
         init_id: id(),
         create_id: None,
+        out_of_band: VecDeque::new(),
         received: now,
         ping_sent: false,
         oversized_key: RandomState::new(),
@@ -471,22 +482,40 @@ impl Coordinator {
             }
             event["response"] = parameters;
         }
+        let format = match event.pointer("/response/audio/output/format") {
+            Some(format) => audio_format(format).map_err(|e| Error::Config(e.to_string()))?,
+            None => self.config.capabilities.output_audio,
+        };
+        let pending = Pending {
+            event_id: event["event_id"].as_str().expect("set above").to_owned(),
+            deadline: Instant::now() + self.config.limits.acknowledgement_timeout,
+            format,
+        };
         if out_of_band {
             // Parallel by design; the host correlates it through its own metadata.
+            if self.out_of_band.len() >= self.config.limits.responses {
+                return Err(Error::Protocol(
+                    "too many out-of-band requests pending".into(),
+                ));
+            }
+            // Without a reported format, a created response takes the requested one.
+            if self.out_of_band.iter().any(|p| p.format != format) {
+                return Err(Error::Config(
+                    "pending out-of-band requests must share an output format".into(),
+                ));
+            }
+            self.send(event)?;
             self.out_of_band_requested = true;
-            return self.send(event);
+            self.out_of_band.push_back(pending);
+            return Ok(());
         }
         if !self.active.is_empty() || self.create_id.is_some() {
             return Err(Error::Protocol(
                 "response already active or requested".into(),
             ));
         }
-        let event_id = event["event_id"].as_str().expect("set above").to_owned();
         self.send(event)?;
-        self.create_id = Some((
-            event_id,
-            Instant::now() + self.config.limits.acknowledgement_timeout,
-        ));
+        self.create_id = Some(pending);
         Ok(())
     }
     /// Forwards a client event whose state the harness does not own.
@@ -548,7 +577,12 @@ impl Coordinator {
         {
             return Err(Error::Timeout("tool result acknowledgement"));
         }
-        if self.create_id.as_ref().is_some_and(|(_, t)| now >= *t) {
+        if self
+            .create_id
+            .iter()
+            .chain(&self.out_of_band)
+            .any(|p| now >= p.deadline)
+        {
             return Err(Error::Timeout("response creation"));
         }
         Ok(())
@@ -772,47 +806,39 @@ impl Coordinator {
                     .and_then(Value::as_bool)
                     == Some(true);
                 if let Some(format) = event.pointer("/session/audio/output/format") {
-                    self.config.capabilities.output_audio = match format["type"].as_str() {
-                        Some("audio/pcm") => {
-                            let sample_rate = format
-                                .get("rate")
-                                .map_or(Some(24_000), Value::as_u64)
-                                .and_then(|n| u32::try_from(n).ok())
-                                .filter(|n| *n > 0)
-                                .ok_or_else(|| {
-                                    Error::Protocol("invalid negotiated PCM rate".into())
-                                })?;
-                            AudioFormat::Pcm16 { sample_rate }
-                        }
-                        Some("audio/pcmu" | "audio/pcma") => AudioFormat::G711,
-                        _ => {
-                            return Err(Error::Protocol(
-                                "unsupported negotiated output audio format".into(),
-                            ));
-                        }
-                    };
+                    self.config.capabilities.output_audio = audio_format(format)?;
                 }
                 self.ready = true;
             }
             "response.created" => {
                 let rid = field(&event["response"], "id")?;
                 let conversation = conversation(&event["response"]);
-                let state = self.response(rid)?;
-                if !state.created {
+                let reported = event
+                    .pointer("/response/audio/output/format")
+                    .map(audio_format)
+                    .transpose()?;
+                if !self.response(rid)?.created {
+                    let pending = if conversation == Some(false) {
+                        self.out_of_band.pop_front()
+                    } else {
+                        self.create_id.take()
+                    };
+                    let format = reported.or(pending.map(|p| p.format));
+                    let state = self.response(rid)?;
                     state.created = true;
                     state.conversation = state.conversation.or(conversation);
-                    let in_progress = !state.done;
-                    if conversation != Some(false) {
-                        if in_progress {
-                            self.active.insert(rid.to_owned());
-                        }
-                        self.create_id = None;
+                    state.format = state.format.or(format);
+                    if conversation != Some(false) && !state.done {
+                        self.active.insert(rid.to_owned());
                     }
                 }
             }
             "response.output_audio.delta" => {
                 let rid = field(&event, "response_id")?;
-                self.response(rid)?;
+                let format = self
+                    .response(rid)?
+                    .format
+                    .unwrap_or(self.config.capabilities.output_audio);
                 let item = field(&event, "item_id")?;
                 let index = event["content_index"]
                     .as_u64()
@@ -833,10 +859,10 @@ impl Coordinator {
                 }
                 let part = self.audio.entry(key).or_insert_with(|| AudioPart {
                     response: rid.to_owned(),
-                    format: self.config.capabilities.output_audio,
+                    format,
                     ..Default::default()
                 });
-                if part.response != rid || part.format != self.config.capabilities.output_audio {
+                if part.response != rid || part.format != format {
                     return Err(Error::Protocol(
                         "audio item response or format conflict".into(),
                     ));
@@ -909,14 +935,16 @@ impl Coordinator {
                         "tool result rejected; delivery not retried".into(),
                     ));
                 }
+                // No retry: the consumer sees the error and chooses the next action.
                 if self
                     .create_id
                     .as_ref()
-                    .is_some_and(|(id, _)| Some(id.as_str()) == event_id)
+                    .is_some_and(|p| Some(p.event_id.as_str()) == event_id)
                 {
                     self.create_id = None;
-                    // No retry: the consumer sees the error and chooses the next action.
                 }
+                self.out_of_band
+                    .retain(|p| Some(p.event_id.as_str()) != event_id);
             }
             _ => {}
         }
@@ -1075,5 +1103,24 @@ fn conversation(response: &Value) -> Option<bool> {
         Some(Value::Null) => Some(false),
         Some(Value::String(_)) => Some(true),
         _ => None,
+    }
+}
+
+/// A GA output format object.
+fn audio_format(format: &Value) -> Result<AudioFormat, Error> {
+    match format["type"].as_str() {
+        Some("audio/pcm") => {
+            let sample_rate = format
+                .get("rate")
+                .map_or(Some(24_000), Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| Error::Protocol("invalid negotiated PCM rate".into()))?;
+            Ok(AudioFormat::Pcm16 { sample_rate })
+        }
+        Some("audio/pcmu" | "audio/pcma") => Ok(AudioFormat::G711),
+        _ => Err(Error::Protocol(
+            "unsupported negotiated output audio format".into(),
+        )),
     }
 }

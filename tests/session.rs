@@ -1445,3 +1445,95 @@ async fn events_are_forwarded_unless_the_harness_owns_their_state() {
     assert_eq!(*session.status.borrow(), Status::Ready);
     session.finish().await.unwrap();
 }
+
+#[tokio::test]
+async fn requested_output_format_governs_that_responses_playback_positions() {
+    let (mut session, mut peer) = start(ToolRegistry::empty()).await;
+    let g711 = json!({"audio":{"output":{"format":{"type":"audio/pcmu"}}}});
+    let second = STANDARD.encode([0u8; 8000]); // One second of G.711; 167 ms as PCM16.
+    let interrupt = |rid: &str| Command::Interrupt {
+        response_id: rid.into(),
+        heard: vec![Heard {
+            item_id: format!("a_{rid}"),
+            content_index: 0,
+            audio_end_ms: 500,
+        }],
+    };
+    let respond = |response: Value| Command::Respond {
+        response: Some(response),
+    };
+    // A default-conversation request, then an out-of-band one: without a reported
+    // format, each response takes the one its request asked for. A reported one wins.
+    let mut out_of_band = g711.clone();
+    out_of_band["conversation"] = json!("none");
+    let reported = json!({"conversation_id":"conv","audio":g711["audio"]});
+    for (request, mut response, rid) in [
+        (g711, json!({"conversation_id":"conv"}), "r"),
+        (out_of_band, json!({"conversation_id":null}), "o"),
+        (json!({}), reported, "p"),
+    ] {
+        session.handle.send(respond(request)).unwrap();
+        recv(&mut peer).await;
+        response["id"] = json!(rid);
+        send(
+            &mut peer,
+            json!({"type":"response.created","response":response}),
+        )
+        .await;
+        send(&mut peer, json!({"type":"response.output_audio.delta","response_id":rid,"item_id":format!("a_{rid}"),"content_index":0,"delta":second})).await;
+        drain_until(&mut session, "response.output_audio.delta").await;
+        session.handle.send(interrupt(rid)).unwrap();
+        assert_eq!(recv(&mut peer).await["type"], "response.cancel");
+        let truncate = recv(&mut peer).await;
+        assert_eq!(truncate["type"], "conversation.item.truncate");
+        assert_eq!(truncate["audio_end_ms"], 500);
+        done(&mut peer, rid, "cancelled", vec![]).await;
+        drain_until(&mut session, "response.done").await;
+    }
+    // Only one format can be inferred for requests awaiting creation.
+    session
+        .handle
+        .send(respond(json!({"conversation":"none"})))
+        .unwrap();
+    recv(&mut peer).await;
+    session
+        .handle
+        .send(respond(
+            json!({"conversation":"none","audio":{"output":{"format":{"type":"audio/pcma"}}}}),
+        ))
+        .unwrap();
+    assert!(
+        rejected(&mut session)
+            .await
+            .contains("share an output format")
+    );
+    session.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn unacknowledged_out_of_band_requests_time_out() {
+    let (mut session, mut peer) = open(ToolRegistry::empty(), |c| {
+        c.limits.acknowledgement_timeout = Duration::from_millis(100)
+    })
+    .await;
+    ready(&mut session, &mut peer).await;
+    let respond = || Command::Respond {
+        response: Some(json!({"conversation":"none"})),
+    };
+    // Created and rejected requests are settled.
+    session.handle.send(respond()).unwrap();
+    recv(&mut peer).await;
+    send(&mut peer, json!({"type":"response.created","response":{"id":"o","status":"in_progress","conversation_id":null}})).await;
+    session.handle.send(respond()).unwrap();
+    let rejected = recv(&mut peer).await;
+    send(&mut peer, json!({"type":"error","error":{"type":"invalid_request_error","message":"no","event_id":rejected["event_id"]}})).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(*session.status.borrow(), Status::Ready);
+    // A request the server never acknowledges ends the session at its deadline.
+    session.handle.send(respond()).unwrap();
+    recv(&mut peer).await;
+    assert_eq!(
+        failed(&mut session).await,
+        Error::Timeout("response creation")
+    );
+}

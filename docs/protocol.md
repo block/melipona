@@ -55,6 +55,15 @@ Once a session has requested an out-of-band response, a tool call from a respons
 that reports no `conversation_id` ends the session instead of executing, because
 its owner is unknown. Correlate out-of-band responses through their `metadata`.
 
+Every request must be acknowledged by `response.created`, or by an `error` naming
+its `event_id`, within `acknowledgement_timeout`; otherwise the session ends.
+Out-of-band requests are settled by `response.created` with a null
+`conversation_id`, in send order, and at most `limits.responses` may be pending.
+A response's output format is the one `response.created` reports, else the one
+its request asked for, else the session's. Because out-of-band responses are
+matched to requests only by order, pending out-of-band requests must ask for the
+same format.
+
 Controls have independent bounded admission and an urgent socket lane. They can
 overtake queued media, but not a frame already being written. Audio/commit retain
 ordinary FIFO order. Full command queues reject admission; full internal queues
