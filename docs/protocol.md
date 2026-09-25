@@ -57,13 +57,15 @@ its owner is unknown. Correlate out-of-band responses through their `metadata`.
 
 Every request must be acknowledged by `response.created`, or by an `error` naming
 its `event_id`, within `acknowledgement_timeout`; otherwise the session ends.
-Out-of-band responses run in parallel, but `response.created` does not name the
-request it answers, so only one out-of-band request may await acknowledgement at
-a time; another is rejected until the first is created or fails. A
-`response.created` without `conversation_id` settles a pending in-band request
-first, else the out-of-band one.
+`response.created` does not name the request it answers, and with server VAD
+the server creates responses of its own. So only one request, in-band or
+out-of-band, may await acknowledgement at a time; another is rejected until the
+first is created or fails, and any `response.created` settles it. Created
+out-of-band responses still run in parallel.
 A response's output format is fixed at `response.created`: the one it reports,
-else the one its request asked for, else the session's at that moment.
+else the session's at that moment. A creation is never assumed to answer the
+pending request, so if that request asked for a different format and the
+creation reports none, the session ends rather than mismeasure playback.
 
 Controls have independent bounded admission and an urgent socket lane. They can
 overtake queued media, but not a frame already being written. Audio/commit retain

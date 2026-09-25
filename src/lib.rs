@@ -196,7 +196,8 @@ pub enum Command {
     /// conversation's response, may declare its own tools, and its tool calls are
     /// returned to the host in `response.done`, never executed. After one, calls from a
     /// response that reports no `conversation_id` end the session instead. Only one
-    /// out-of-band request may await `response.created` at a time.
+    /// request of either kind may await `response.created` at a time, and it must
+    /// report any requested output format other than the session's.
     Respond {
         #[serde(default)]
         response: Option<Value>,

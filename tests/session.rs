@@ -276,6 +276,37 @@ async fn fallback_parallel_tools_and_acknowledged_batch_continuation() {
 }
 
 #[tokio::test]
+async fn continuation_waits_for_a_pending_request_to_settle() {
+    for created in [true, false] {
+        let (tools, mut calls) = registry();
+        let (session, mut peer) = start(tools).await;
+        session
+            .handle
+            .send(Command::Respond {
+                response: Some(json!({"conversation":"none"})),
+            })
+            .unwrap();
+        let request = recv(&mut peer).await;
+        let call = item("c", r#"{"value":1}"#, "echo");
+        send(&mut peer,json!({"type":"response.done","response":{"id":"r","status":"completed","conversation_id":"conv","output":[call]}})).await;
+        calls.recv().await.unwrap();
+        let result = recv(&mut peer).await;
+        acknowledge(&mut peer, &result).await;
+        quiet(&mut peer).await;
+        let settle = if created {
+            json!({"type":"response.created","response":{"id":"o","conversation_id":null}})
+        } else {
+            json!({"type":"error","error":{"message":"no","event_id":request["event_id"]}})
+        };
+        send(&mut peer, settle).await;
+        let create = recv(&mut peer).await;
+        assert_eq!(create["type"], "response.create");
+        assert!(create.get("response").is_none());
+        session.finish().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn slow_tools_do_not_block_microphone_or_output_audio() {
     let (tools, mut calls) = registry();
     let (mut session, mut peer) = start(tools).await;
@@ -1471,7 +1502,7 @@ async fn events_are_forwarded_unless_the_harness_owns_their_state() {
 }
 
 #[tokio::test]
-async fn requested_output_format_governs_that_responses_playback_positions() {
+async fn reported_output_format_governs_and_an_unreported_override_fails_closed() {
     let (mut session, mut peer) = start(ToolRegistry::empty()).await;
     let g711 = json!({"audio":{"output":{"format":{"type":"audio/pcmu"}}}});
     let second = STANDARD.encode([0u8; 8000]); // One second of G.711; 167 ms as PCM16.
@@ -1486,15 +1517,15 @@ async fn requested_output_format_governs_that_responses_playback_positions() {
     let respond = |response: Value| Command::Respond {
         response: Some(response),
     };
-    // A default-conversation request, then an out-of-band one: without a reported
-    // format, each response takes the one its request asked for. A reported one wins.
+    // Default-conversation, out-of-band and unrequested G.711 as response.created reports it.
     let mut out_of_band = g711.clone();
     out_of_band["conversation"] = json!("none");
-    let reported = json!({"conversation_id":"conv","audio":g711["audio"]});
+    let reported =
+        |conversation: Value| json!({"conversation_id":conversation,"audio":g711["audio"]});
     for (request, mut response, rid) in [
-        (g711, json!({"conversation_id":"conv"}), "r"),
-        (out_of_band, json!({"conversation_id":null}), "o"),
-        (json!({}), reported, "p"),
+        (g711.clone(), reported(json!("conv")), "r"),
+        (out_of_band.clone(), reported(Value::Null), "o"),
+        (json!({}), reported(json!("conv")), "p"),
     ] {
         session.handle.send(respond(request)).unwrap();
         recv(&mut peer).await;
@@ -1514,7 +1545,25 @@ async fn requested_output_format_governs_that_responses_playback_positions() {
         done(&mut peer, rid, "cancelled", vec![]).await;
         drain_until(&mut session, "response.done").await;
     }
-    session.finish().await.unwrap();
+    // Explicitly asking for the session's format needs no report.
+    session
+        .handle
+        .send(respond(
+            json!({"audio":{"output":{"format":{"type":"audio/pcm"}}}}),
+        ))
+        .unwrap();
+    recv(&mut peer).await;
+    created(&mut peer, "q").await;
+    drain_until(&mut session, "response.created").await;
+    // An unattributed creation (here the server's own, with VAD) may not be the
+    // G.711 request, so without a reported format it cannot be measured.
+    session.handle.send(respond(out_of_band)).unwrap();
+    recv(&mut peer).await;
+    created(&mut peer, "v").await;
+    assert!(matches!(
+        failed(&mut session).await,
+        Error::Protocol(e) if e.contains("omits a requested output format")
+    ));
 }
 
 #[tokio::test]
@@ -1527,15 +1576,17 @@ async fn unacknowledged_out_of_band_requests_time_out() {
     let respond = || Command::Respond {
         response: Some(json!({"conversation":"none"})),
     };
-    // A created response names no request, so one awaits acknowledgement at a time.
+    // A created response names no request, so one of any kind awaits acknowledgement.
     session.handle.send(respond()).unwrap();
     let first = recv(&mut peer).await;
-    session.handle.send(respond()).unwrap();
-    assert!(
-        rejected(&mut session)
-            .await
-            .contains("awaiting acknowledgement")
-    );
+    for command in [respond(), Command::Respond { response: None }] {
+        session.handle.send(command).unwrap();
+        assert!(
+            rejected(&mut session)
+                .await
+                .contains("awaiting acknowledgement")
+        );
+    }
     // Rejected and created requests are settled.
     send(&mut peer, json!({"type":"error","error":{"type":"invalid_request_error","message":"no","event_id":first["event_id"]}})).await;
     drain_until(&mut session, "error").await;

@@ -92,7 +92,7 @@ executor owns authorization and side effects. Blocking work belongs in
 Commands also support base64 audio chunks, manual audio commit/clear, images,
 response interruption with heard-audio positions, and individual tool cancellation.
 `respond` accepts any `response.create` parameters, including parallel out-of-band
-responses (acknowledged one at a time), and `event` forwards any other Realtime client event, so every GA client
+responses (requests are acknowledged one at a time), and `event` forwards any other Realtime client event, so every GA client
 event is reachable. Text and image insertion do not implicitly request a response. With server VAD,
 the provider normally commits audio and responds; with turn detection disabled,
 send `commit_audio` followed by `respond`.

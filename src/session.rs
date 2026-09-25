@@ -200,11 +200,11 @@ struct Response {
     /// Output format fixed at creation; the session default applies before it.
     format: Option<AudioFormat>,
 }
-/// A `response.create` awaiting its `response.created`, with the format it requested.
+/// A `response.create` awaiting its `response.created`, with any format it requested.
 struct Pending {
     event_id: String,
     deadline: Instant,
-    format: AudioFormat,
+    format: Option<AudioFormat>,
 }
 struct Call {
     response: String,
@@ -250,9 +250,9 @@ struct Coordinator {
     frankie_feedback: bool,
     init_id: String,
     init_deadline: Instant,
+    /// The one request awaiting acknowledgement: `response.created` names no request,
+    /// so any creation, or an error naming this one, settles it.
     create_id: Option<Pending>,
-    /// The one unacknowledged out-of-band request; creation and errors settle it.
-    out_of_band: Option<Pending>,
     received: Instant,
     ping_sent: bool,
     oversized_key: RandomState,
@@ -305,7 +305,6 @@ async fn run(
         frankie_feedback: false,
         init_id: id(),
         create_id: None,
-        out_of_band: None,
         received: now,
         ping_sent: false,
         oversized_key: RandomState::new(),
@@ -482,35 +481,28 @@ impl Coordinator {
             }
             event["response"] = parameters;
         }
-        let format = match event.pointer("/response/audio/output/format") {
-            Some(format) => audio_format(format).map_err(|e| Error::Config(e.to_string()))?,
-            None => self.config.capabilities.output_audio,
-        };
-        let pending = Pending {
-            event_id: event["event_id"].as_str().expect("set above").to_owned(),
-            deadline: Instant::now() + self.config.limits.acknowledgement_timeout,
-            format,
-        };
-        if out_of_band {
-            // Responses run in parallel, but a created response names no request, so
-            // one acknowledgement at a time keeps its identity, deadline and format.
-            if self.out_of_band.is_some() {
-                return Err(Error::Protocol(
-                    "out-of-band request awaiting acknowledgement".into(),
-                ));
-            }
-            self.send(event)?;
-            self.out_of_band_requested = true;
-            self.out_of_band = Some(pending);
-            return Ok(());
-        }
-        if !self.active.is_empty() || self.create_id.is_some() {
+        let format = event
+            .pointer("/response/audio/output/format")
+            .map(audio_format)
+            .transpose()
+            .map_err(|e| Error::Config(e.to_string()))?;
+        if self.create_id.is_some() {
             return Err(Error::Protocol(
-                "response already active or requested".into(),
+                "response request awaiting acknowledgement".into(),
             ));
         }
+        // Out-of-band responses run beside the default conversation's one.
+        if !out_of_band && !self.active.is_empty() {
+            return Err(Error::Protocol("response already active".into()));
+        }
+        let event_id = event["event_id"].as_str().expect("set above").to_owned();
         self.send(event)?;
-        self.create_id = Some(pending);
+        self.out_of_band_requested |= out_of_band;
+        self.create_id = Some(Pending {
+            event_id,
+            deadline: Instant::now() + self.config.limits.acknowledgement_timeout,
+            format,
+        });
         Ok(())
     }
     /// Forwards a client event whose state the harness does not own.
@@ -572,12 +564,7 @@ impl Coordinator {
         {
             return Err(Error::Timeout("tool result acknowledgement"));
         }
-        if self
-            .create_id
-            .iter()
-            .chain(&self.out_of_band)
-            .any(|p| now >= p.deadline)
-        {
+        if self.create_id.as_ref().is_some_and(|p| now >= p.deadline) {
             return Err(Error::Timeout("response creation"));
         }
         Ok(())
@@ -813,15 +800,16 @@ impl Coordinator {
                     .map(audio_format)
                     .transpose()?;
                 if !self.response(rid)?.created {
-                    // Without conversation_id, a pending in-band request answers first.
-                    let pending = match conversation {
-                        Some(false) => self.out_of_band.take(),
-                        Some(true) => self.create_id.take(),
-                        None => self.create_id.take().or_else(|| self.out_of_band.take()),
-                    };
-                    let format = reported
-                        .or(pending.map(|p| p.format))
-                        .unwrap_or(self.config.capabilities.output_audio);
+                    // The creation may answer the pending request or be the server's
+                    // own (VAD), so it never inherits that request's format.
+                    let session = self.config.capabilities.output_audio;
+                    let requested = self.create_id.take().and_then(|p| p.format);
+                    if reported.is_none() && requested.is_some_and(|f| f != session) {
+                        return Err(Error::Protocol(
+                            "response.created omits a requested output format".into(),
+                        ));
+                    }
+                    let format = reported.unwrap_or(session);
                     let state = self.response(rid)?;
                     state.created = true;
                     state.conversation = state.conversation.or(conversation);
@@ -829,6 +817,7 @@ impl Coordinator {
                     if conversation != Some(false) && !state.done {
                         self.active.insert(rid.to_owned());
                     }
+                    self.continue_ready()?;
                 }
             }
             "response.output_audio.delta" => {
@@ -934,13 +923,13 @@ impl Coordinator {
                     ));
                 }
                 // No retry: the consumer sees the error and chooses the next action.
-                for pending in [&mut self.create_id, &mut self.out_of_band] {
-                    if pending
-                        .as_ref()
-                        .is_some_and(|p| Some(p.event_id.as_str()) == event_id)
-                    {
-                        *pending = None;
-                    }
+                if self
+                    .create_id
+                    .as_ref()
+                    .is_some_and(|p| Some(p.event_id.as_str()) == event_id)
+                {
+                    self.create_id = None;
+                    self.continue_ready()?;
                 }
             }
             _ => {}
