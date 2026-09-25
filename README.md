@@ -34,9 +34,9 @@ and turn detection. Melipona includes no model weights, inference server, or aud
 Your app
 mic + player
      |
-Melipona ----- Your tools
-session       ToolExecutor / MCP
-+ playback
+Melipona ---- Your tools
+session      ToolExecutor
++ playback   or local MCP
      |
 Realtime endpoint
 model + voice
