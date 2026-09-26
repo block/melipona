@@ -1,5 +1,4 @@
-//! Optional local stdio MCP client. The host authorizes every exposed tool by
-//! choosing its server configuration. This is not a sandbox or an approval UI.
+#![doc = include_str!("../docs/mcp.md")]
 
 use crate::{Error, Tool, ToolCall, ToolCancellation, ToolExecutor, ToolFuture, ToolRegistry};
 use futures_util::{StreamExt, future::join_all};
